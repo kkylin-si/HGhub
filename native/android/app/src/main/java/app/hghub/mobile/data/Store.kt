@@ -22,6 +22,13 @@ class AppStore(ctx: Context) {
         private set
     var preferHevc by mutableStateOf(prefs.getBoolean("preferHevc", false))
         private set
+    /** 打开后，按 Home 回到桌面时进入系统小窗，不在应用内缩小。 */
+    var pipOnDesktop by mutableStateOf(prefs.getBoolean("pip", false))
+        private set
+    var canDesktopPip by mutableStateOf(false)
+    var inPip by mutableStateOf(false)
+    var pipWidth by mutableStateOf(9)
+    var pipHeight by mutableStateOf(16)
     var immersive by mutableStateOf(false)
     var favs by mutableStateOf(intsFrom(prefs.getString("favs", null)))
         private set
@@ -59,6 +66,11 @@ class AppStore(ctx: Context) {
     fun applyPreferHevc(on: Boolean) {
         preferHevc = on
         prefs.edit().putBoolean("preferHevc", on).apply()
+    }
+
+    fun applyPipOnDesktop(on: Boolean) {
+        pipOnDesktop = on
+        prefs.edit().putBoolean("pip", on).apply()
     }
 
     fun applyMuteOnStartup(on: Boolean) {

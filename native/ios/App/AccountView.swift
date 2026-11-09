@@ -110,6 +110,7 @@ struct LibraryScreen: View {
     var back: () -> Void
     var open: (Int, Int, Double) -> Void
     var series: (Int, Int, Double) -> Void
+    var float: (Int, Int, Double) -> Void = { _, _, _ in }
     @EnvironmentObject private var model: AppModel
     @Environment(\.hg) private var hg
     @State private var cards: [Detail] = []
@@ -151,6 +152,10 @@ struct LibraryScreen: View {
                         progressFor: { id in
                             guard kind == "history", let watch = model.history.first(where: { $0.id == id }) else { return nil }
                             return (ep: watch.ep, time: watch.t)
+                        },
+                        onMini: { id, ep, time in
+                            swipe = false
+                            float(id, ep, time)
                         }
                     )
                     .frame(maxWidth: .infinity, maxHeight: .infinity)

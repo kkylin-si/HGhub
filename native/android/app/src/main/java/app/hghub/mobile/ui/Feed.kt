@@ -2,6 +2,7 @@ package app.hghub.mobile.ui
 
 import android.app.Activity
 import android.content.Context
+import android.os.Build
 import android.content.ContextWrapper
 import android.content.pm.ActivityInfo
 import android.graphics.drawable.ClipDrawable
@@ -46,6 +47,7 @@ import androidx.compose.material.icons.filled.Favorite
 import androidx.compose.material.icons.outlined.FavoriteBorder
 import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material.icons.filled.FullscreenExit
+import androidx.compose.material.icons.filled.PictureInPictureAlt
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Star
@@ -95,13 +97,18 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.VideoSize
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
+import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.core.app.PictureInPictureModeChangedInfo
+import androidx.core.util.Consumer
+import app.hghub.mobile.pipParams
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -133,6 +140,8 @@ fun VideoFeed(
     episodePaging: Boolean = false,
     onEnterSeries: ((Int, Int, Double) -> Unit)? = null,
     progressOf: (Int) -> Pair<Int, Double>? = { null },
+    mini: Boolean = false,
+    onMini: ((Int, Int, Double) -> Unit)? = null,
 ) {
     val app = LocalApp.current
     val context = LocalContext.current
@@ -241,12 +250,59 @@ fun VideoFeed(
     }
 
     val lifecycle = LocalLifecycleOwner.current.lifecycle
+    val activity = context.findActivity() as? ComponentActivity
+    var inPip by remember { mutableStateOf(activity?.isInPictureInPictureMode == true) }
+    var scrubbing by remember { mutableStateOf(false) }
+    var wide by remember { mutableStateOf(false) }
+    DisposableEffect(player) {
+        fun apply(size: VideoSize) {
+            wide = size.height > 0 && size.width * size.pixelWidthHeightRatio > size.height
+        }
+        val listener = object : Player.Listener {
+            override fun onVideoSizeChanged(videoSize: VideoSize) = apply(videoSize)
+            override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                wide = false
+            }
+        }
+        player.addListener(listener)
+        apply(player.videoSize)
+        onDispose { player.removeListener(listener) }
+    }
+    DisposableEffect(activity) {
+        if (activity == null) return@DisposableEffect onDispose {}
+        val listener = Consumer<PictureInPictureModeChangedInfo> { info ->
+            inPip = info.isInPictureInPictureMode
+            app.store.inPip = info.isInPictureInPictureMode
+        }
+        activity.addOnPictureInPictureModeChangedListener(listener)
+        onDispose { activity.removeOnPictureInPictureModeChangedListener(listener) }
+    }
     DisposableEffect(lifecycle, player) {
         val obs = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_STOP) player.pause()
+            if (event == Lifecycle.Event.ON_STOP && activity?.isInPictureInPictureMode != true) player.pause()
         }
         lifecycle.addObserver(obs)
-        onDispose { lifecycle.removeObserver(obs) }
+        onDispose {
+            lifecycle.removeObserver(obs)
+            app.store.canDesktopPip = false
+        }
+    }
+    LaunchedEffect(player, app.store.pipOnDesktop, inPip) {
+        while (true) {
+            val size = player.videoSize
+            if (size.width > 0 && size.height > 0) {
+                app.store.pipWidth = size.width
+                app.store.pipHeight = size.height
+            }
+            val active = player.mediaItemCount > 0 && player.playbackState != Player.STATE_IDLE
+            app.store.canDesktopPip = active
+            if (Build.VERSION.SDK_INT >= 26 && activity != null) {
+                activity.setPictureInPictureParams(
+                    pipParams(app.store.pipOnDesktop, active, app.store.pipWidth, app.store.pipHeight),
+                )
+            }
+            delay(500)
+        }
     }
 
     LaunchedEffect(player) {
@@ -326,13 +382,15 @@ fun VideoFeed(
         chrome = false
     }
 
-    DisposableEffect(fullscreen) {
-        val activity = context.findActivity()
-        val window = activity?.window
-        activity?.requestedOrientation = if (fullscreen) {
-            ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-        } else {
-            ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+    DisposableEffect(fullscreen, inPip) {
+        val host = context.findActivity()
+        val window = host?.window
+        if (!inPip) {
+            host?.requestedOrientation = if (fullscreen) {
+                ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            } else {
+                ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            }
         }
         val controller = window?.let { WindowCompat.getInsetsController(it, it.decorView) }
         if (fullscreen) {
@@ -344,7 +402,9 @@ fun VideoFeed(
         app.store.immersive = fullscreen
         onDispose {
             app.store.immersive = false
-            activity?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            if (host?.isInPictureInPictureMode != true) {
+                host?.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            }
             if (window != null) {
                 WindowCompat.getInsetsController(window, window.decorView).show(WindowInsetsCompat.Type.systemBars())
             }
@@ -512,6 +572,14 @@ fun VideoFeed(
             )
             Spacer(Modifier.width(8.dp))
             Icon(
+                Icons.Filled.PictureInPictureAlt,
+                "小窗",
+                tint = if (app.store.pipOnDesktop) Color(0xFFE08A6E) else Color.White,
+                modifier = Modifier.size(40.dp).clickable {
+                    app.store.applyPipOnDesktop(!app.store.pipOnDesktop)
+                }.padding(8.dp),
+            )
+            Icon(
                 if (fullscreen) Icons.Filled.FullscreenExit else Icons.Filled.Fullscreen,
                 if (fullscreen) "退出全屏" else "全屏",
                 tint = Color.White,
@@ -593,7 +661,7 @@ fun VideoFeed(
                 modifier = Modifier.size(72.dp).clickable { player.play() },
             )
         }
-        if ((switching || buffering) && failed.isBlank()) {
+        if ((switching || buffering) && !scrubbing && failed.isBlank()) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 CircularProgressIndicator(color = Color(0xFFE08A6E), strokeWidth = 2.dp)
                 Spacer(Modifier.height(8.dp))
@@ -621,7 +689,7 @@ fun VideoFeed(
 
     Box(Modifier.fillMaxSize().background(Color.Black)) {
         Box(Modifier.fillMaxSize()) {
-                VerticalPager(state = pager, modifier = Modifier.fillMaxSize()) { page ->
+                VerticalPager(state = pager, userScrollEnabled = !mini && !inPip, modifier = Modifier.fillMaxSize()) { page ->
                     val id = if (episodePaging) currentId else ids.getOrNull(page) ?: currentId
                     val card = Library.get(id)
                     val active = page == pager.currentPage
@@ -643,7 +711,7 @@ fun VideoFeed(
                                 modifier = Modifier.fillMaxSize(),
                                 update = {
                                     it.player = player
-                                    it.resizeMode = if (fullscreen) {
+                                    it.resizeMode = if (fullscreen || mini || inPip || wide) {
                                         AspectRatioFrameLayout.RESIZE_MODE_FIT
                                     } else {
                                         AspectRatioFrameLayout.RESIZE_MODE_ZOOM
@@ -653,7 +721,7 @@ fun VideoFeed(
                         } else {
                             CoverImage(card?.cover.orEmpty(), Modifier.fillMaxSize(), 0.dp)
                         }
-                        Box(
+                        if (!mini && !inPip) Box(
                             Modifier.fillMaxSize().pointerInput(active, fullscreen) {
                                 if (!active) return@pointerInput
                                 detectTapGestures(onTap = {
@@ -670,7 +738,7 @@ fun VideoFeed(
                         )
                     }
                 }
-                if (!fullscreen) {
+                if (!fullscreen && !mini && !inPip) {
                     Column(
                         Modifier.align(Alignment.CenterEnd).padding(end = 10.dp, bottom = 210.dp),
                         verticalArrangement = Arrangement.spacedBy(14.dp),
@@ -697,9 +765,11 @@ fun VideoFeed(
                         }
                     }
                 }
-                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Status() }
+                if (!fullscreen) {
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Status() }
+                }
             }
-            if (!fullscreen) {
+            if (!fullscreen && !mini && !inPip) {
                 Box(
                     Modifier.fillMaxWidth().height(220.dp).align(Alignment.BottomCenter).background(
                         Brush.verticalGradient(listOf(Color.Transparent, Color(0xCC000000))),
@@ -709,21 +779,6 @@ fun VideoFeed(
                     Modifier.align(Alignment.BottomCenter).then(if (onBack != null) Modifier.navigationBarsPadding() else Modifier),
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
-                    Text(
-                        "全屏观看",
-                        color = Color.White,
-                        fontSize = 14.sp,
-                        modifier = Modifier
-                            .padding(bottom = 10.dp)
-                            .clip(RoundedCornerShape(999.dp))
-                            .background(Color(0x73000000))
-                            .clickable {
-                                chrome = true
-                                chromeTick += 1
-                                fullscreen = true
-                            }
-                            .padding(horizontal = 14.dp, vertical = 8.dp),
-                    )
                     if (!episodePaging) {
                         Column(Modifier.fillMaxWidth().padding(start = 16.dp, end = 84.dp, bottom = 8.dp)) {
                             Text(title, color = Color.White, fontFamily = Serif, fontSize = 22.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
@@ -737,14 +792,14 @@ fun VideoFeed(
                             }
                         }
                     }
-                    ProgressScrubber(player)
+                    ProgressScrubber(player) { scrubbing = it }
                     EpisodeBar(pickHere = false)
                     Spacer(Modifier.height(8.dp))
                 }
                 TopControls()
             }
         }
-        if (fullscreen && chrome) {
+        if (fullscreen && chrome && !mini && !inPip) {
             Column(Modifier.fillMaxSize().statusBarsPadding()) {
                 TopControls()
                 Box(
@@ -755,7 +810,10 @@ fun VideoFeed(
                 ) {
                     Status()
                 }
-                ProgressScrubber(player) { active -> if (active) chromeTick += 1 }
+                ProgressScrubber(player) { active ->
+                    scrubbing = active
+                    if (active) chromeTick += 1
+                }
                 EpisodeBar(pickHere = true)
                 Spacer(Modifier.navigationBarsPadding().height(8.dp))
             }
@@ -1118,7 +1176,12 @@ private fun CommentSheet(
 }
 
 @Composable
-fun HomeFeed(onOpenSearch: () -> Unit, onEnterSeries: (Int, Int, Double) -> Unit = { _, _, _ -> }) {
+fun HomeFeed(
+    onOpenSearch: () -> Unit,
+    onEnterSeries: (Int, Int, Double) -> Unit = { _, _, _ -> },
+    mini: Boolean = false,
+    onMini: ((Int, Int, Double) -> Unit)? = null,
+) {
     val app = LocalApp.current
     val scope = rememberCoroutineScope()
     var items by remember { mutableStateOf(HomeCache.items) }
@@ -1165,6 +1228,8 @@ fun HomeFeed(onOpenSearch: () -> Unit, onEnterSeries: (Int, Int, Double) -> Unit
                 if (!loading && !done) scope.launch { load(page + 1) }
             },
             onEnterSeries = onEnterSeries,
+            mini = mini,
+            onMini = onMini,
         )
     }
     if (false) onOpenSearch()

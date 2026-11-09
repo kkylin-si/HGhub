@@ -10,6 +10,8 @@ final class AppModel: ObservableObject {
     @Published var muteOnStartup: Bool
     /// 为真时优先播 HEVC 高清；这一集没有高清地址就用标准。
     @Published var preferHevc: Bool
+    /// 打开后，离开应用回到桌面时才进入系统小窗。
+    @Published var pipOnDesktop: Bool
     @Published var favs: [Int]
     @Published var likes: [Int]
     @Published var history: [Watch]
@@ -37,6 +39,7 @@ final class AppModel: ObservableObject {
         dark = d.bool(forKey: "hg_dark")
         muteOnStartup = d.object(forKey: "hg_mute_startup") == nil ? true : d.bool(forKey: "hg_mute_startup")
         preferHevc = d.bool(forKey: "hg_hevc")
+        pipOnDesktop = d.bool(forKey: "hg_pip")
         muted = d.object(forKey: "hg_muted") == nil ? true : d.bool(forKey: "hg_muted")
         favs = d.array(forKey: "hg_favs") as? [Int] ?? []
         likes = d.array(forKey: "hg_likes") as? [Int] ?? []
@@ -62,6 +65,7 @@ final class AppModel: ObservableObject {
     func setMuted(_ on: Bool) { muted = on; defaults.set(on, forKey: "hg_muted") }
     func setMuteOnStartup(_ on: Bool) { muteOnStartup = on; defaults.set(on, forKey: "hg_mute_startup") }
     func setPreferHevc(_ on: Bool) { preferHevc = on; defaults.set(on, forKey: "hg_hevc") }
+    func setPipOnDesktop(_ on: Bool) { pipOnDesktop = on; defaults.set(on, forKey: "hg_pip") }
 
     func setLine(_ url: String) {
         let next = url.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "/"))

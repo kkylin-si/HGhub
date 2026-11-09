@@ -1,4 +1,5 @@
 import AVFoundation
+import AVKit
 import SwiftUI
 import UIKit
 
@@ -9,6 +10,7 @@ final class PlayerBox: ObservableObject {
     @Published var waiting = true
     @Published var paused = false
     @Published var failed = ""
+    @Published var wide = false
     private var observer: Any?
 
     init() {
@@ -24,6 +26,8 @@ final class PlayerBox: ObservableObject {
                 self.failed = "这一集暂时播不了，可换线路或重试"
                 self.waiting = false
             }
+            let size = self.player.currentItem?.presentationSize ?? .zero
+            self.wide = size.height > 1 && size.width > size.height
         }
     }
 
@@ -34,6 +38,7 @@ final class PlayerBox: ObservableObject {
     func open(_ url: URL, muted: Bool) {
         failed = ""
         waiting = true
+        wide = false
         let item = AVPlayerItem(url: url)
         player.replaceCurrentItem(with: item)
         player.isMuted = muted
@@ -44,22 +49,39 @@ final class PlayerBox: ObservableObject {
 struct PlayerSurface: UIViewRepresentable {
     let player: AVPlayer
     var fill = true
+    var pip = false
     func makeUIView(context: Context) -> PlayerHost {
         let view = PlayerHost()
         view.playerLayer.player = player
         view.playerLayer.videoGravity = fill ? .resizeAspectFill : .resizeAspect
         view.backgroundColor = .black
+        view.configurePip(pip)
         return view
     }
     func updateUIView(_ uiView: PlayerHost, context: Context) {
         uiView.playerLayer.player = player
         uiView.playerLayer.videoGravity = fill ? .resizeAspectFill : .resizeAspect
+        uiView.configurePip(pip)
     }
 }
 
 final class PlayerHost: UIView {
     override class var layerClass: AnyClass { AVPlayerLayer.self }
     var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
+    private var pipController: AVPictureInPictureController?
+
+    func configurePip(_ on: Bool) {
+        guard on, AVPictureInPictureController.isPictureInPictureSupported() else {
+            pipController?.canStartPictureInPictureAutomaticallyFromInline = false
+            return
+        }
+        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
+        try? AVAudioSession.sharedInstance().setActive(true)
+        if pipController == nil {
+            pipController = AVPictureInPictureController(playerLayer: playerLayer)
+        }
+        pipController?.canStartPictureInPictureAutomaticallyFromInline = true
+    }
 }
 
 /// 系统 UISlider：拖动时圆点跟手，播放时按屏幕刷新往前走。
@@ -210,6 +232,8 @@ struct FeedScreen: View {
     var onEnterSeries: ((Int, Int, Double) -> Void)? = nil
     /// 历史滑动时，每部剧回到自己记下的集数和进度。
     var progressFor: (Int) -> (ep: Int, time: Double)? = { _ in nil }
+    var mini = false
+    var onMini: (Int, Int, Double) -> Void = { _, _, _ in }
 
     @EnvironmentObject private var model: AppModel
     @EnvironmentObject private var proxy: MediaProxy
@@ -246,8 +270,10 @@ struct FeedScreen: View {
         GeometryReader { _ in
             ZStack {
                 Color.black
-                if fullscreen {
-                    PlayerSurface(player: box.player, fill: false).ignoresSafeArea()
+                if mini {
+                    PlayerSurface(player: box.player, fill: true, pip: model.pipOnDesktop)
+                } else if fullscreen {
+                    PlayerSurface(player: box.player, fill: false, pip: model.pipOnDesktop).ignoresSafeArea()
                     Color.clear
                         .contentShape(Rectangle())
                         .onTapGesture { toggleChrome() }
@@ -265,7 +291,7 @@ struct FeedScreen: View {
                     }
                     playbackStatus
                 } else {
-                    PlayerSurface(player: box.player, fill: true)
+                    PlayerSurface(player: box.player, fill: !box.wide, pip: model.pipOnDesktop)
                         .ignoresSafeArea()
                     LinearGradient(colors: [.clear, .black.opacity(0.72)], startPoint: .center, endPoint: .bottom)
                         .ignoresSafeArea()
@@ -285,18 +311,6 @@ struct FeedScreen: View {
                                 .padding(.trailing, 10)
                                 .padding(.bottom, 12)
                         }
-                        Button {
-                            chrome = true
-                            fullscreen = true
-                        } label: {
-                            Label("全屏观看", systemImage: "arrow.up.left.and.arrow.down.right")
-                                .font(.subheadline.weight(.medium))
-                                .foregroundStyle(.white)
-                                .padding(.horizontal, 14).padding(.vertical, 8)
-                                .background(.black.opacity(0.45))
-                                .clipShape(Capsule())
-                        }
-                        .padding(.bottom, 12)
                         if !episodePaging {
                             caption(id)
                                 .padding(.horizontal, 16)
@@ -469,6 +483,13 @@ struct FeedScreen: View {
                     .clipShape(Capsule())
             }
             Button {
+                model.setPipOnDesktop(!model.pipOnDesktop)
+            } label: {
+                Image(systemName: "pip.enter")
+                    .foregroundStyle(model.pipOnDesktop ? hg.accent : .white)
+                    .padding(8)
+            }
+            Button {
                 fullscreen.toggle()
             } label: {
                 Image(systemName: fullscreen ? "arrow.down.right.and.arrow.up.left" : "arrow.up.left.and.arrow.down.right")
@@ -582,7 +603,7 @@ struct FeedScreen: View {
 
     @ViewBuilder
     private var playbackStatus: some View {
-        if (switching || box.waiting) && box.failed.isEmpty {
+        if (switching || box.waiting) && box.failed.isEmpty && scrubLabel == nil {
             VStack(spacing: 8) {
                 ProgressView().tint(hg.accent)
                 Text("加载中").font(.caption).foregroundStyle(.white)
@@ -854,6 +875,8 @@ final class Library {
 
 struct HomeFeed: View {
     var openSeries: (Int, Int, Double) -> Void = { _, _, _ in }
+    var mini = false
+    var onMini: (Int, Int, Double) -> Void = { _, _, _ in }
     @EnvironmentObject private var model: AppModel
     @State private var items: [VideoCard] = []
     @State private var page = 1
@@ -873,7 +896,7 @@ struct HomeFeed: View {
             } else {
                 FeedScreen(ids: items.map(\.id), start: 0, showsBack: false, onNearEnd: {
                     if !done && !loading { Task { await load(page + 1, reset: false) } }
-                }, onEnterSeries: openSeries)
+                }, onEnterSeries: openSeries, mini: mini, onMini: onMini)
             }
         }
         .task { if items.isEmpty { await load(1, reset: true) } }

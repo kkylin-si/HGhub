@@ -3,15 +3,21 @@ package app.hghub.mobile.ui
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.drag
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.GridView
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Person
@@ -31,10 +37,16 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlin.math.abs
+import kotlin.math.roundToInt
 import app.hghub.mobile.LocalApp
 import kotlinx.coroutines.delay
 
@@ -51,6 +63,18 @@ private sealed interface Route {
     data object Settings : Route
 }
 
+private sealed interface PlaySlot {
+    data object Home : PlaySlot
+    data class Feed(val ids: List<Int>, val index: Int, val ep: Int, val time: Double) : PlaySlot
+    data class Series(val id: Int, val ep: Int, val time: Double) : PlaySlot
+}
+
+private fun PlaySlot.key(): String = when (this) {
+    PlaySlot.Home -> "home"
+    is PlaySlot.Feed -> "feed-${ids.size}-${index}-${ep}-${ids.firstOrNull() ?: 0}"
+    is PlaySlot.Series -> "series-$id-$ep"
+}
+
 @Composable
 fun Shell() {
     val app = LocalApp.current
@@ -58,7 +82,56 @@ fun Shell() {
     var tab by remember { mutableStateOf(Tab.Home) }
     var stack by remember { mutableStateOf<List<Route>>(emptyList()) }
     var login by remember { mutableStateOf(false) }
+    var mini by remember { mutableStateOf(false) }
+    var parked by remember { mutableStateOf<PlaySlot?>(null) }
+    var miniOffset by remember { mutableStateOf(IntOffset.Zero) }
     val top = stack.lastOrNull()
+    val live = when {
+        mini -> parked
+        top is Route.Feed -> PlaySlot.Feed(top.ids, top.index, top.ep, top.time)
+        top is Route.Series -> PlaySlot.Series(top.id, top.ep, top.time)
+        top == null && tab == Tab.Home -> PlaySlot.Home
+        else -> null
+    }
+    val fullPlayer = live != null && !mini
+
+    fun closeMini() {
+        mini = false
+        parked = null
+        miniOffset = IntOffset.Zero
+    }
+    fun openFeed(ids: List<Int>, index: Int) {
+        closeMini()
+        stack = stack + Route.Feed(ids, index, 1, 0.0)
+    }
+    fun openSeries(id: Int, ep: Int, time: Double) {
+        closeMini()
+        stack = stack + Route.Series(id, ep.coerceAtLeast(1), time)
+    }
+    fun enterMini() {
+        val slot = live ?: return
+        if (mini) return
+        parked = slot
+        miniOffset = IntOffset.Zero
+        if (top is Route.Feed || top is Route.Series) stack = stack.dropLast(1)
+        mini = true
+    }
+    fun expandMini() {
+        val slot = parked ?: return
+        mini = false
+        parked = null
+        miniOffset = IntOffset.Zero
+        when (slot) {
+            PlaySlot.Home -> tab = Tab.Home
+            is PlaySlot.Feed -> stack = stack + Route.Feed(slot.ids, slot.index, slot.ep, slot.time)
+            is PlaySlot.Series -> stack = stack + Route.Series(slot.id, slot.ep, slot.time)
+        }
+    }
+    fun floatSeries(id: Int, ep: Int, time: Double) {
+        parked = PlaySlot.Series(id, ep.coerceAtLeast(1), time)
+        miniOffset = IntOffset.Zero
+        mini = true
+    }
 
     BackHandler(enabled = login || stack.isNotEmpty() || tab != Tab.Home) {
         when {
@@ -68,81 +141,150 @@ fun Shell() {
         }
     }
 
-    Column(Modifier.fillMaxSize().background(if (top is Route.Feed || top is Route.Series || (top == null && tab == Tab.Home)) androidx.compose.ui.graphics.Color.Black else c.paper)) {
+    Column(Modifier.fillMaxSize().background(if (fullPlayer || (top == null && tab == Tab.Home && !mini)) Color.Black else c.paper)) {
         Box(Modifier.weight(1f).fillMaxWidth()) {
-            when (top) {
-                is Route.Feed -> VideoFeed(
-                    top.ids, top.index, top.ep, top.time,
-                    onBack = { stack = stack.dropLast(1) },
-                    onNearEnd = null,
-                    onEnterSeries = { id, ep, time -> stack = stack + Route.Series(id, ep, time) },
-                )
-                is Route.Series -> key(top.id, top.ep) {
-                    VideoFeed(
-                        listOf(top.id), 0, top.ep, top.time,
-                        onBack = { stack = stack.dropLast(1) },
-                        onNearEnd = null,
-                        episodePaging = true,
-                    )
-                }
-                is Route.Channel -> ChannelScreen(top.cate, top.name, { stack = stack.dropLast(1) }) { ids, index ->
-                    stack = stack + Route.Feed(ids, index, 1, 0.0)
-                }
-                Route.Ranks -> RankScreen({ stack = stack.dropLast(1) }) { id ->
-                    stack = stack + Route.Feed(listOf(id), 0, 1, 0.0)
-                }
-                Route.Posts -> PostsScreen({ stack = stack.dropLast(1) }) { id ->
-                    stack = stack + Route.PostDetail(id)
-                }
-                is Route.PostDetail -> PostScreen(top.id) { stack = stack.dropLast(1) }
-                is Route.Library -> LibraryScreen(
-                    kind = top.kind,
-                    onBack = { stack = stack.dropLast(1) },
-                    onOpen = { id, ep, time -> stack = stack + Route.Series(id, ep, time) },
-                    onSeries = { id, ep, time -> stack = stack + Route.Series(id, ep, time) },
-                )
-                Route.Settings -> SettingsScreen { stack = stack.dropLast(1) }
-                null -> when (tab) {
-                    Tab.Home -> HomeFeed({}, onEnterSeries = { id, ep, time -> stack = stack + Route.Series(id, ep, time) })
-                    Tab.Search -> SearchScreen(
-                        onOpen = { ids, index -> stack = stack + Route.Feed(ids, index, 1, 0.0) },
-                        onRanks = { stack = stack + Route.Ranks },
-                    )
-                    Tab.Category -> CategoryScreen(
-                        onChannel = { cate, name -> stack = stack + Route.Channel(cate, name) },
-                        onRanks = { stack = stack + Route.Ranks },
-                        onPosts = { stack = stack + Route.Posts },
-                        onOpen = { ids, index -> stack = stack + Route.Feed(ids, index, 1, 0.0) },
-                    )
-                    Tab.Profile -> ProfileScreen(
-                        onSettings = { stack = stack + Route.Settings },
-                        onLogin = { login = true },
-                        onLibrary = { kind -> stack = stack + Route.Library(kind) },
-                    )
+            if (!fullPlayer) {
+                Box(Modifier.fillMaxSize()) {
+                    when (top) {
+                        is Route.Feed, is Route.Series -> Unit
+                        is Route.Channel -> ChannelScreen(top.cate, top.name, { stack = stack.dropLast(1) }) { ids, index ->
+                            openFeed(ids, index)
+                        }
+                        Route.Ranks -> RankScreen({ stack = stack.dropLast(1) }) { id -> openFeed(listOf(id), 0) }
+                        Route.Posts -> PostsScreen({ stack = stack.dropLast(1) }) { id ->
+                            closeMini()
+                            stack = stack + Route.PostDetail(id)
+                        }
+                        is Route.PostDetail -> PostScreen(top.id) { stack = stack.dropLast(1) }
+                        is Route.Library -> LibraryScreen(
+                            kind = top.kind,
+                            onBack = { stack = stack.dropLast(1) },
+                            onOpen = { id, ep, time -> openSeries(id, ep, time) },
+                            onSeries = { id, ep, time -> openSeries(id, ep, time) },
+                            onFloat = { id, ep, time -> floatSeries(id, ep, time) },
+                        )
+                        Route.Settings -> SettingsScreen { stack = stack.dropLast(1) }
+                        null -> when (tab) {
+                            Tab.Home -> if (mini && parked is PlaySlot.Home) {
+                                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                    Text("正在小窗播放", color = c.ink, fontSize = 16.sp)
+                                }
+                            } else if (live !is PlaySlot.Home) {
+                                HomeFeed({}, onEnterSeries = { id, ep, time -> openSeries(id, ep, time) })
+                            }
+                            Tab.Search -> SearchScreen(
+                                onOpen = { ids, index -> openFeed(ids, index) },
+                                onRanks = { stack = stack + Route.Ranks },
+                            )
+                            Tab.Category -> CategoryScreen(
+                                onChannel = { cate, name -> stack = stack + Route.Channel(cate, name) },
+                                onRanks = { stack = stack + Route.Ranks },
+                                onPosts = { stack = stack + Route.Posts },
+                                onOpen = { ids, index -> openFeed(ids, index) },
+                            )
+                            Tab.Profile -> ProfileScreen(
+                                onSettings = { stack = stack + Route.Settings },
+                                onLogin = { login = true },
+                                onLibrary = { kind -> stack = stack + Route.Library(kind) },
+                            )
+                        }
+                    }
                 }
             }
-            val toast = app.store.toast
-            if (!toast.isNullOrBlank()) {
-                Text(
-                    toast,
-                    color = c.onAccent,
-                    fontSize = 13.sp,
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .padding(bottom = 16.dp)
-                        .clip(RoundedCornerShape(999.dp))
-                        .background(c.accent)
-                        .padding(horizontal = 16.dp, vertical = 10.dp),
-                )
-                androidx.compose.runtime.LaunchedEffect(toast) {
-                    delay(2200)
-                    if (app.store.toast == toast) app.store.toast = null
+            live?.let { slot ->
+            Box(
+                if (mini) {
+                    Modifier
+                        .align(Alignment.BottomEnd)
+                        .padding(end = 12.dp, bottom = 12.dp)
+                        .offset { miniOffset }
+                        .size(132.dp, 210.dp)
+                        .clip(RoundedCornerShape(14.dp))
+                } else {
+                    Modifier.fillMaxSize()
+                },
+            ) {
+                key(slot.key()) {
+                    when (slot) {
+                        PlaySlot.Home -> HomeFeed(
+                            {},
+                            onEnterSeries = { id, ep, time -> openSeries(id, ep, time) },
+                            mini = mini,
+                            onMini = { _, _, _ -> enterMini() },
+                        )
+                        is PlaySlot.Feed -> VideoFeed(
+                            slot.ids, slot.index, slot.ep, slot.time,
+                            onBack = { stack = stack.dropLast(1) },
+                            onNearEnd = null,
+                            onEnterSeries = { id, ep, time -> openSeries(id, ep, time) },
+                            mini = mini,
+                            onMini = { _, _, _ -> enterMini() },
+                        )
+                        is PlaySlot.Series -> VideoFeed(
+                            listOf(slot.id), 0, slot.ep, slot.time,
+                            onBack = { stack = stack.dropLast(1) },
+                            onNearEnd = null,
+                            episodePaging = true,
+                            mini = mini,
+                            onMini = { _, _, _ -> enterMini() },
+                        )
+                    }
+                }
+                    if (mini) {
+                        Box(
+                            Modifier.fillMaxSize().pointerInput(slot.key()) {
+                                awaitEachGesture {
+                                    val down = awaitFirstDown()
+                                    var moved = 0f
+                                    val dragging = drag(down.id) { change ->
+                                        val delta = change.positionChange()
+                                        moved += abs(delta.x) + abs(delta.y)
+                                        miniOffset = IntOffset(
+                                            miniOffset.x + delta.x.roundToInt(),
+                                            miniOffset.y + delta.y.roundToInt(),
+                                        )
+                                        change.consume()
+                                    }
+                                    if (!dragging || moved < 12f) expandMini()
+                                }
+                            },
+                        )
+                        Icon(
+                            Icons.Filled.Close,
+                            "关闭小窗",
+                            tint = Color.White,
+                            modifier = Modifier
+                                .align(Alignment.TopEnd)
+                                .padding(4.dp)
+                                .size(28.dp)
+                                .clip(androidx.compose.foundation.shape.CircleShape)
+                                .background(Color(0xCC000000))
+                                .clickable { closeMini() }
+                                .padding(4.dp),
+                        )
+                    }
                 }
             }
+        val toast = app.store.toast
+        if (!toast.isNullOrBlank()) {
+            Text(
+                toast,
+                color = c.onAccent,
+                fontSize = 13.sp,
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 16.dp)
+                    .clip(RoundedCornerShape(999.dp))
+                    .background(c.accent)
+                    .padding(horizontal = 16.dp, vertical = 10.dp),
+            )
+            androidx.compose.runtime.LaunchedEffect(toast) {
+                delay(2200)
+                if (app.store.toast == toast) app.store.toast = null
+            }
         }
-        if (top == null && !app.store.immersive) {
-            TabBar(tab) { tab = it }
         }
+        if (top == null && !app.store.immersive && !app.store.inPip) TabBar(tab) { tab = it }
     }
     if (login) LoginSheet { login = false }
 }

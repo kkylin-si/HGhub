@@ -143,6 +143,7 @@ fun LibraryScreen(
     onBack: () -> Unit,
     onOpen: (Int, Int, Double) -> Unit,
     onSeries: (Int, Int, Double) -> Unit,
+    onFloat: (Int, Int, Double) -> Unit = { _, _, _ -> },
 ) {
     val app = LocalApp.current
     val c = LocalHg.current
@@ -193,6 +194,10 @@ fun LibraryScreen(
                             onBack = null,
                             onNearEnd = null,
                             onEnterSeries = onSeries,
+                            onMini = { id, ep, time ->
+                                swipe = false
+                                onFloat(id, ep, time)
+                            },
                             progressOf = { id ->
                                 if (kind != "history") null
                                 else store.history.firstOrNull { it.id == id }?.let { it.ep to it.t }
