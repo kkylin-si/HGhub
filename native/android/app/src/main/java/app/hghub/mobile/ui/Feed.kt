@@ -109,6 +109,7 @@ import app.hghub.mobile.Library
 import app.hghub.mobile.LocalApp
 import app.hghub.mobile.data.Comment
 import app.hghub.mobile.data.Detail
+import app.hghub.mobile.data.PlayInfo
 import app.hghub.mobile.data.fmtClock
 import app.hghub.mobile.data.fmtCount
 import kotlinx.coroutines.CancellationException
@@ -221,13 +222,12 @@ fun VideoFeed(
                 }
                 val stay = player.currentPosition
                 if (stay > 300) resume = stay / 1000.0
-                val all = playbackOrigins(app.store.base)
-                if (lineAttempt < all.lastIndex) {
+                if (lineAttempt < 1) {
                     lineAttempt += 1
                     failed = ""
-                    app.store.show("当前线路拥挤，正在换线路")
+                    app.store.show("正在重新获取播放地址")
                 } else {
-                    failed = "这一集暂时播不了，可换线路或重试"
+                    failed = "这一集暂时播不了，可稍后重试"
                     switching = false
                     buffering = false
                 }
@@ -391,29 +391,45 @@ fun VideoFeed(
         }
         if (loadedDetail?.liked == true && !app.store.isLiked(id)) app.store.toggleLike(id)
         if (loadedDetail?.collected == true && !app.store.isFav(id)) app.store.toggleFav(id)
-        val lines = playbackOrigins(base).drop(lineAttempt.coerceAtLeast(0))
-        var playInfo: app.hghub.mobile.data.PlayInfo? = null
-        var originUsed = ""
+        var playInfo: PlayInfo? = null
         var lastError = "没有可播放的地址"
-        for (origin in lines) {
+        for (attempt in 0..1) {
             if (!stillCurrent(episodePaging, pager.currentPage, ids, id, episode)) return@LaunchedEffect
             try {
-                val info = app.api.play(id, episode, origin)
-                val candidate = if (app.store.preferHevc && info.hevcUrl.isNotBlank()) info.hevcUrl else info.videoUrl
-                if (candidate.isNotBlank() || info.videoUrl.isNotBlank()) {
+                val info = app.api.playback(id, episode)
+                if (info.videoUrl.isNotBlank() || info.hevcUrl.isNotBlank()) {
                     playInfo = info
-                    originUsed = origin
                     break
                 }
+                lastError = "没有可播放的地址"
+                break
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 lastError = e.message ?: lastError
+                if (attempt == 1 || !playRetryable(lastError)) break
+                delay(700)
             }
+        }
+        if (playInfo == null && stillCurrent(episodePaging, pager.currentPage, ids, id, episode)) {
+            val legacy = try {
+                app.api.play(id, episode)
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                lastError = e.message ?: lastError
+                null
+            }
+            if (legacy != null && (legacy.videoUrl.isNotBlank() || legacy.hevcUrl.isNotBlank())) playInfo = legacy
+        }
+        if (playInfo == null && !loadedDetail?.videoUrl.isNullOrBlank()) {
+            playInfo = PlayInfo(
+                id, episode, loadedDetail?.title.orEmpty(), 0, loadedDetail?.videoUrl.orEmpty(), "",
+            )
         }
         val play = playInfo
         if (!stillCurrent(episodePaging, pager.currentPage, ids, id, episode)) return@LaunchedEffect
-        if (play == null || originUsed.isBlank()) {
+        if (play == null) {
             failed = lastError
             switching = false
             buffering = false
@@ -429,8 +445,13 @@ fun VideoFeed(
             buffering = false
             return@LaunchedEffect
         }
-        val origin = originUsed.trimEnd('/')
-        dataSource.setDefaultRequestProperties(mapOf("Referer" to "$origin/", "Origin" to origin))
+        val origin = base.trim().trimEnd('/')
+        val headers = buildMap {
+            put("Referer", "$origin/")
+            put("Origin", origin)
+            if (play.cdnHeader == "x-cdn-auth" && play.cdnValue.isNotBlank()) put(play.cdnHeader, play.cdnValue)
+        }
+        dataSource.setDefaultRequestProperties(headers)
         playGen += 1
         player.setMediaItem(MediaItem.fromUri(url))
         player.prepare()
@@ -444,12 +465,11 @@ fun VideoFeed(
         if (playGen == 0) return@LaunchedEffect
         delay(9000)
         if (player.playbackState != Player.STATE_BUFFERING || player.currentPosition > 800) return@LaunchedEffect
-        val all = playbackOrigins(base)
-        if (lineAttempt >= all.lastIndex) return@LaunchedEffect
+        if (lineAttempt >= 1) return@LaunchedEffect
         val stay = player.currentPosition
         if (stay > 300) resume = stay / 1000.0
         lineAttempt += 1
-        app.store.show("当前线路拥挤，正在换线路")
+        app.store.show("正在重新获取播放地址")
     }
 
     @Composable
@@ -810,12 +830,11 @@ private class EndBridge {
     var at: Long = 0L
 }
 
-private fun playbackOrigins(current: String): List<String> {
-    val fixed = listOf("https://huangguoai.com", "https://huangguoai.ai")
-    return (listOf(current.trim().trimEnd('/')) + fixed)
-        .map { it.trimEnd('/') }
-        .filter { it.startsWith("https://") }
-        .distinct()
+private fun playRetryable(message: String): Boolean {
+    val msg = message.lowercase()
+    return msg.contains("http 408") || msg.contains("http 429") || msg.contains("http 5") ||
+        msg.contains("timeout") || msg.contains("timed out") || msg.contains("超时") ||
+        msg.contains("failed to connect") || msg.contains("unable to resolve")
 }
 
 private fun stillCurrent(episodePaging: Boolean, page: Int, ids: List<Int>, id: Int, episode: Int): Boolean {

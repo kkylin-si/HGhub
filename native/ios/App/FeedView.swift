@@ -352,11 +352,10 @@ struct FeedScreen: View {
                 model.show("高清暂时播不了，已切回标准")
                 return
             }
-            let all = playbackOrigins(model.base)
-            guard lineAttempt < all.count - 1 else { return }
+            guard lineAttempt < 1 else { return }
             lineAttempt += 1
             box.failed = ""
-            model.show("当前线路拥挤，正在换线路")
+            model.show("正在重新获取播放地址")
             queuePlayback()
         }
         .onChange(of: fullscreen) { on in
@@ -385,10 +384,9 @@ struct FeedScreen: View {
             if box.pos > 0.5 { waitSince = nil }
             if box.failed.isEmpty, (switching || box.waiting), box.pos < 0.5, let waitSince, Date().timeIntervalSince(waitSince) > 9 {
                 self.waitSince = nil
-                let all = playbackOrigins(model.base)
-                if lineAttempt < all.count - 1 {
+                if lineAttempt < 1 {
                     lineAttempt += 1
-                    model.show("当前线路拥挤，正在换线路")
+                    model.show("正在重新获取播放地址")
                     queuePlayback()
                 }
             }
@@ -768,28 +766,36 @@ struct FeedScreen: View {
                 if loaded.liked && !model.isLiked(id) { model.toggleLike(id) }
                 if loaded.collected && !model.isFav(id) { model.toggleFav(id) }
             }
-            let lines = Array(playbackOrigins(model.base).dropFirst(lineAttempt))
             var play: PlayInfo?
-            var used = ""
             var last = "没有可播放的地址"
-            for origin in lines {
+            for attempt in 0..<2 {
                 if Task.isCancelled || self.ep != episode { return }
                 do {
-                    let info = try await model.api.play(id, ep: episode, origin: origin)
-                    let candidate = (model.preferHevc && !info.hevcUrl.isEmpty) ? info.hevcUrl : info.videoUrl
-                    if !candidate.isEmpty || !info.videoUrl.isEmpty {
+                    let info = try await model.api.playback(id, ep: episode)
+                    if !info.videoUrl.isEmpty || !info.hevcUrl.isEmpty {
                         play = info
-                        used = origin
                         break
                     }
+                    last = "没有可播放的地址"
+                    break
                 } catch is CancellationError {
                     return
                 } catch {
                     last = error.localizedDescription
+                    if attempt == 1 || !playRetryable(last) { break }
+                    try? await Task.sleep(nanoseconds: 700_000_000)
+                }
+            }
+            if play == nil, !Task.isCancelled, self.ep == episode {
+                if let legacy = try? await model.api.play(id, ep: episode),
+                   !legacy.videoUrl.isEmpty || !legacy.hevcUrl.isEmpty {
+                    play = legacy
+                } else if let detail, !detail.videoUrl.isEmpty {
+                    play = PlayInfo(ep: episode, title: detail.title, videoUrl: detail.videoUrl, hevcUrl: "")
                 }
             }
             guard !Task.isCancelled, self.ep == episode else { return }
-            guard let play, !used.isEmpty else {
+            guard let play else {
                 box.failed = last
                 box.waiting = false
                 switching = false
@@ -805,7 +811,13 @@ struct FeedScreen: View {
                 switching = false
                 return
             }
-            proxy.updateReferer(used + "/")
+            let origin = model.base.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            proxy.updateReferer(origin + "/")
+            if play.cdnHeader == "x-cdn-auth", !play.cdnValue.isEmpty {
+                proxy.updatePlaybackHeaders([play.cdnHeader: play.cdnValue])
+            } else {
+                proxy.updatePlaybackHeaders([:])
+            }
             guard let local = proxy.wrap(remote) else {
                 box.failed = "没有可播放的地址"
                 box.waiting = false
@@ -818,15 +830,13 @@ struct FeedScreen: View {
         }
     }
 
-    private func playbackOrigins(_ current: String) -> [String] {
-        let fixed = ["https://huangguoai.com", "https://huangguoai.ai"]
-        var all: [String] = []
-        for raw in [current] + fixed {
-            let url = raw.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-            if url.hasPrefix("https://") && !all.contains(url) { all.append(url) }
-        }
-        return all
-    }
+}
+
+private func playRetryable(_ message: String) -> Bool {
+    let msg = message.lowercased()
+    return msg.contains("http 408") || msg.contains("http 429") || msg.contains("http 5") ||
+        msg.contains("timeout") || msg.contains("timed out") || msg.contains("超时") ||
+        msg.contains("failed to connect") || msg.contains("unable to resolve")
 }
 
 enum Sheet: Identifiable {

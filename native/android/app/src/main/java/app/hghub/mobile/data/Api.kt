@@ -55,6 +55,11 @@ class HgApi(private val store: AppStore) {
     suspend fun play(id: Int, ep: Int, origin: String? = null): PlayInfo =
         get("/api/videos/$id/play?ep=$ep&page_texts=0", origin).toPlay()
 
+    /** 当前站点的播放地址从这里取，旧的 play 接口会返回空的 video_url。 */
+    suspend fun playback(id: Int, ep: Int): PlayInfo = withContext(Dispatchers.IO) {
+        call("POST", "/api/videos/$id/episodes/$ep/playback", JSONObject(), auth = false).toPlayback()
+    }
+
     suspend fun comments(id: Int, ep: Int, page: Int): Pair<List<Comment>, PageInfo> =
         get("/api/videos/$id/comments?ep=$ep&page=$page&size=20").let { it.items().map { o -> o.toComment() } to it.toPage() }
 

@@ -47,6 +47,8 @@ data class PlayInfo(
     val duration: Int,
     val videoUrl: String,
     val hevcUrl: String,
+    val cdnHeader: String = "",
+    val cdnValue: String = "",
 )
 
 data class PageInfo(val page: Int, val pages: Int, val total: Int)
@@ -198,6 +200,26 @@ fun JSONObject.toPlay(): PlayInfo = PlayInfo(
     videoUrl = str("video_url"),
     hevcUrl = str("video_url_hevc"),
 )
+
+/** 新播放接口把地址放在 streams.main / streams.hevc，CDN 校验头只接受 x-cdn-auth。 */
+fun JSONObject.toPlayback(): PlayInfo {
+    val streams = obj("streams")
+    val cdn = obj("cdn")
+    val header = cdn?.str("authKey").orEmpty()
+    val value = cdn?.str("authValue").orEmpty()
+    val allowed = header.equals("x-cdn-auth", ignoreCase = true) && value.isNotBlank()
+    val epNum = int("ep").takeIf { it > 0 } ?: int("ep_num").let { if (it == 0) 1 else it }
+    return PlayInfo(
+        id = int("id"),
+        ep = epNum,
+        title = str("title"),
+        duration = int("duration"),
+        videoUrl = streams?.str("main").orEmpty().ifBlank { str("video_url") },
+        hevcUrl = streams?.str("hevc").orEmpty().ifBlank { str("video_url_hevc") },
+        cdnHeader = if (allowed) "x-cdn-auth" else "",
+        cdnValue = if (allowed) value else "",
+    )
+}
 
 fun JSONObject.toPage(): PageInfo {
     val p = obj("pagination") ?: return PageInfo(1, 1, 0)

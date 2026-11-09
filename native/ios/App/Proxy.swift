@@ -5,6 +5,7 @@ import Foundation
 final class MediaProxy: ObservableObject {
     @Published var port: UInt16 = 0
     var referer = "https://huangguoai.com/"
+    private var extraHeaders: [String: String] = [:]
     private var listenFD: Int32 = -1
     private let lock = NSLock()
     private let ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
@@ -50,16 +51,22 @@ final class MediaProxy: ObservableObject {
         lock.unlock()
     }
 
+    func updatePlaybackHeaders(_ headers: [String: String]) {
+        lock.lock()
+        extraHeaders = headers.filter { $0.key.lowercased() == "x-cdn-auth" && !$0.value.isEmpty }
+        lock.unlock()
+    }
+
     func wrap(_ remote: String) -> URL? {
         guard port > 0, var parts = URLComponents(string: "http://127.0.0.1:\(port)/v") else { return nil }
         parts.queryItems = [URLQueryItem(name: "u", value: remote)]
         return parts.url
     }
 
-    private func currentReferer() -> String {
+    private func currentRequest() -> (referer: String, extra: [String: String]) {
         lock.lock()
         defer { lock.unlock() }
-        return referer
+        return (referer, extraHeaders)
     }
 
     private func acceptLoop() {
@@ -91,9 +98,16 @@ final class MediaProxy: ObservableObject {
             write(fd, status: 400, type: "text/plain", body: Data("bad request".utf8))
             return
         }
+        let current = currentRequest()
         var req = URLRequest(url: remoteURL)
         req.setValue(ua, forHTTPHeaderField: "User-Agent")
-        req.setValue(currentReferer(), forHTTPHeaderField: "Referer")
+        req.setValue(current.referer, forHTTPHeaderField: "Referer")
+        if let page = URL(string: current.referer), let host = page.host, let scheme = page.scheme {
+            req.setValue("\(scheme)://\(host)", forHTTPHeaderField: "Origin")
+        }
+        for (name, value) in current.extra {
+            req.setValue(value, forHTTPHeaderField: name)
+        }
         req.timeoutInterval = 20
         let sem = DispatchSemaphore(value: 0)
         var data: Data?

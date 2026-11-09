@@ -43,6 +43,11 @@ final class HgApi {
     func play(_ id: Int, ep: Int, origin: String? = nil) async throws -> PlayInfo {
         try await call("GET", "/api/videos/\(id)/play?ep=\(ep)&page_texts=0", nil, auth: false, origin: origin).play()
     }
+
+    /// 当前站点的播放地址从这里取，旧的 play 接口会返回空的 video_url。
+    func playback(_ id: Int, ep: Int) async throws -> PlayInfo {
+        try await call("POST", "/api/videos/\(id)/episodes/\(ep)/playback", [:], auth: false).playback()
+    }
     func comments(_ id: Int, ep: Int) async throws -> [CommentItem] {
         try await get("/api/videos/\(id)/comments?ep=\(ep)&page=1&size=20").rows("items").map { $0.comment() }
     }

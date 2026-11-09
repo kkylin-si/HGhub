@@ -26,7 +26,14 @@ struct Detail: Hashable {
     var liked: Bool
     var collected: Bool
 }
-struct PlayInfo { var ep: Int; var title: String; var videoUrl: String; var hevcUrl: String }
+struct PlayInfo {
+    var ep: Int
+    var title: String
+    var videoUrl: String
+    var hevcUrl: String
+    var cdnHeader: String = ""
+    var cdnValue: String = ""
+}
 struct PageInfo { var page: Int; var pages: Int }
 struct CommentItem: Identifiable, Hashable { var id: Int; var nickname: String; var text: String; var time: String }
 struct RankItem: Identifiable, Hashable {
@@ -129,6 +136,25 @@ extension Dictionary where Key == String, Value == Any {
 
     func play() -> PlayInfo {
         PlayInfo(ep: Swift.max(int("ep_num"), 1), title: str("title"), videoUrl: str("video_url"), hevcUrl: str("video_url_hevc"))
+    }
+
+    func playback() -> PlayInfo {
+        let streams = child("streams")
+        let cdn = child("cdn")
+        let header = cdn?.str("authKey") ?? ""
+        let value = cdn?.str("authValue") ?? ""
+        let allowed = header.lowercased() == "x-cdn-auth" && !value.isEmpty
+        let episode = int("ep") > 0 ? int("ep") : Swift.max(int("ep_num"), 1)
+        let main = streams?.str("main") ?? ""
+        let hevc = streams?.str("hevc") ?? ""
+        return PlayInfo(
+            ep: episode,
+            title: str("title"),
+            videoUrl: main.isEmpty ? str("video_url") : main,
+            hevcUrl: hevc.isEmpty ? str("video_url_hevc") : hevc,
+            cdnHeader: allowed ? "x-cdn-auth" : "",
+            cdnValue: allowed ? value : ""
+        )
     }
 
     func page() -> PageInfo {
