@@ -122,9 +122,13 @@ final class AppModel: ObservableObject {
         defaults.removeObject(forKey: "hg_searches")
     }
 
-    func saveWatch(id: Int, ep: Int, t: Double, dur: Double) {
+    func saveWatch(id: Int, ep: Int, t: Double, dur: Double, keepFurther: Bool = false) {
         guard id > 0 else { return }
-        let item = Watch(id: id, ep: max(ep, 1), t: max(t, 0), dur: max(dur, 0), at: Date().timeIntervalSince1970)
+        let epN = max(ep, 1)
+        if keepFurther, let prev = history.first(where: { $0.id == id }), prev.ep > epN { return }
+        let prev = history.first { $0.id == id }
+        let time = (prev?.ep == epN && t < 1 && (prev?.t ?? 0) > t) ? (prev?.t ?? t) : max(t, 0)
+        let item = Watch(id: id, ep: epN, t: time, dur: max(dur, 0), at: Date().timeIntervalSince1970)
         history = Array(([item] + history.filter { $0.id != id }).prefix(40))
         let rows: [[String: Any]] = history.map { ["id": $0.id, "ep": $0.ep, "t": $0.t, "dur": $0.dur, "at": $0.at] }
         if let data = try? JSONSerialization.data(withJSONObject: rows) {

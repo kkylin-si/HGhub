@@ -18,7 +18,14 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.KeyboardArrowRight
+import androidx.compose.material.icons.outlined.History
 import androidx.compose.material.icons.outlined.Settings
+import androidx.compose.material.icons.outlined.Star
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.runtime.key
+import androidx.compose.ui.graphics.Color
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.ModalBottomSheet
@@ -50,21 +57,15 @@ import app.hghub.mobile.media.Covers
 import kotlinx.coroutines.launch
 
 @Composable
-fun ProfileScreen(onSettings: () -> Unit, onLogin: () -> Unit, onOpen: (Int, Int, Double) -> Unit) {
-    val app = LocalApp.current
+fun ProfileScreen(
+    onSettings: () -> Unit,
+    onLogin: () -> Unit,
+    onLibrary: (String) -> Unit,
+) {
     val c = LocalHg.current
-    val store = app.store
-    var tab by remember { mutableStateOf("fav") }
-    var cards by remember { mutableStateOf<List<Detail>>(emptyList()) }
-    val ids = if (tab == "fav") store.favs else store.history.map { it.id }
-
-    LaunchedEffect(ids.joinToString(",")) {
-        cards = emptyList()
-        val loaded = ids.take(16).mapNotNull { id -> runCatching { app.api.video(id) }.getOrNull() }
-        cards = loaded
-    }
-
+    val store = LocalApp.current.store
     val name = store.account?.nickname ?: "未登录"
+    val favCount = if (store.account == null) store.favs.size else store.account?.collect ?: store.favs.size
     LazyColumn(Modifier.fillMaxSize().background(c.paper)) {
         item {
             Row(
@@ -109,7 +110,7 @@ fun ProfileScreen(onSettings: () -> Unit, onLogin: () -> Unit, onOpen: (Int, Int
                 }
                 Spacer(Modifier.height(16.dp))
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
-                    Stat("收藏", if (user == null) store.favs.size.toString() else fmtCount(user.collect))
+                    Stat("收藏", fmtCount(favCount))
                     Stat("喜欢", if (user == null) store.likes.size.toString() else fmtCount(user.like))
                     Stat("观看", store.history.size.toString())
                 }
@@ -126,24 +127,107 @@ fun ProfileScreen(onSettings: () -> Unit, onLogin: () -> Unit, onOpen: (Int, Int
             }
         }
         item {
-            Spacer(Modifier.height(16.dp))
-            Row(Modifier.padding(horizontal = 20.dp).clip(RoundedCornerShape(16.dp)).background(c.card).padding(4.dp)) {
-                Seg("收藏", tab == "fav", Modifier.weight(1f)) { tab = "fav" }
-                Seg("历史", tab == "history", Modifier.weight(1f)) { tab = "history" }
+            Spacer(Modifier.height(18.dp))
+            Column(Modifier.padding(horizontal = 20.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                LibraryEntry(Icons.Outlined.Star, "收藏", "${store.favs.size} 部") { onLibrary("fav") }
+                LibraryEntry(Icons.Outlined.History, "观看历史", "${store.history.size} 部") { onLibrary("history") }
+            }
+            Spacer(Modifier.height(28.dp))
+        }
+    }
+}
+
+@Composable
+fun LibraryScreen(
+    kind: String,
+    onBack: () -> Unit,
+    onOpen: (Int, Int, Double) -> Unit,
+    onSeries: (Int, Int) -> Unit,
+) {
+    val app = LocalApp.current
+    val c = LocalHg.current
+    val store = app.store
+    var swipe by remember { mutableStateOf(false) }
+    var cards by remember { mutableStateOf<List<Detail>>(emptyList()) }
+    val ids = if (kind == "fav") store.favs else store.history.map { it.id }
+    val title = if (kind == "fav") "收藏" else "观看历史"
+
+    LaunchedEffect(ids.joinToString(",")) {
+        cards = emptyList()
+        val loaded = ids.take(16).mapNotNull { id -> runCatching { app.api.video(id) }.getOrNull() }
+        cards = loaded
+    }
+
+    if (swipe) {
+        Column(Modifier.fillMaxSize().background(Color.Black)) {
+            Row(
+                Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, top = 18.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(
+                    Icons.Filled.ArrowBack,
+                    "返回",
+                    tint = Color.White,
+                    modifier = Modifier.size(40.dp).clickable { onBack() }.padding(8.dp),
+                )
+                Text(title, color = Color.White, fontFamily = Serif, fontSize = 22.sp, modifier = Modifier.weight(1f))
+                Text(
+                    "列表",
+                    color = Color.White,
+                    fontSize = 13.sp,
+                    modifier = Modifier.clip(RoundedCornerShape(14.dp)).background(Color(0x22FFFFFF)).clickable { swipe = false }.padding(horizontal = 14.dp, vertical = 10.dp),
+                )
+            }
+            if (ids.isEmpty()) {
+                Column(Modifier.fillMaxWidth().weight(1f), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
+                    Text(if (kind == "fav") "还没有收藏" else "还没有观看记录", color = Color.White, fontFamily = Serif, fontSize = 18.sp)
+                }
+            } else {
+                Box(Modifier.weight(1f).fillMaxWidth()) {
+                    key(kind) {
+                        VideoFeed(
+                            ids = ids,
+                            start = 0,
+                            startEp = if (kind == "history") store.history.firstOrNull()?.ep ?: 1 else 1,
+                            startTimeSec = if (kind == "history") store.history.firstOrNull()?.t ?: 0.0 else 0.0,
+                            onBack = null,
+                            onNearEnd = null,
+                            onEnterSeries = onSeries,
+                            progressOf = { id ->
+                                if (kind != "history") null
+                                else store.history.firstOrNull { it.id == id }?.let { it.ep to it.t }
+                            },
+                        )
+                    }
+                }
+            }
+        }
+        return
+    }
+    LazyColumn(Modifier.fillMaxSize().background(c.paper)) {
+        item { PageTitle(title, if (kind == "fav") "看到喜欢的短剧会留在这里" else "看过的剧会记在这里", onBack) }
+        item {
+            Row(Modifier.padding(horizontal = 20.dp), horizontalArrangement = Arrangement.End) {
+                Text(
+                    "滑动",
+                    color = c.ink,
+                    fontSize = 13.sp,
+                    modifier = Modifier.clip(RoundedCornerShape(14.dp)).background(c.card).clickable { swipe = true }.padding(horizontal = 14.dp, vertical = 10.dp),
+                )
             }
         }
         if (cards.isEmpty()) {
             item {
                 Column(Modifier.fillMaxWidth().padding(vertical = 36.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                     Text(
-                        if (ids.isEmpty()) if (tab == "fav") "还没有收藏" else "还没有观看记录" else "正在读取…",
+                        if (ids.isEmpty()) if (kind == "fav") "还没有收藏" else "还没有观看记录" else "正在读取…",
                         color = c.ink,
                         fontFamily = Serif,
                         fontSize = 18.sp,
                     )
                     Spacer(Modifier.height(6.dp))
                     Text(
-                        if (ids.isEmpty()) if (tab == "fav") "看到喜欢的短剧，点一下收藏" else "看过的剧会记在这里" else "稍等一下",
+                        if (ids.isEmpty()) if (kind == "fav") "看到喜欢的短剧，点一下收藏" else "看过的剧会记在这里" else "稍等一下",
                         color = c.muted,
                         fontSize = 13.sp,
                     )
@@ -152,16 +236,46 @@ fun ProfileScreen(onSettings: () -> Unit, onLogin: () -> Unit, onOpen: (Int, Int
         }
         items(cards, key = { it.id }) { d ->
             val progress = store.history.firstOrNull { it.id == d.id }
-            val extra = if (tab == "history" && progress != null) "看到第 ${progress.ep} 集 ${fmtClock(progress.t)}" else "${d.episodeCount} 集"
+            val epName = progress?.let { p -> d.episodes.firstOrNull { it.ep == p.ep }?.title }.orEmpty()
+            val named = epName.isNotBlank() && !epName.matches(Regex("第\\s*${progress?.ep}\\s*集"))
+            val extra = if (kind == "history" && progress != null) {
+                if (named) "第 ${progress.ep} 集 · $epName · 看到 ${fmtClock(progress.t)}"
+                else "第 ${progress.ep} 集 · 看到 ${fmtClock(progress.t)}"
+            } else {
+                "${d.episodeCount} 集"
+            }
             Column(Modifier.padding(horizontal = 20.dp, vertical = 6.dp).clip(RoundedCornerShape(18.dp)).background(c.card)) {
                 VideoRow(d.title, d.cover, extra) {
                     val ep = progress?.ep ?: 1
-                    val t = if (tab == "history") progress?.t ?: 0.0 else 0.0
+                    val t = if (kind == "history") progress?.t ?: 0.0 else 0.0
                     onOpen(d.id, ep, t)
                 }
             }
         }
         item { Spacer(Modifier.height(28.dp)) }
+    }
+}
+
+@Composable
+private fun LibraryEntry(icon: ImageVector, title: String, sub: String, onClick: () -> Unit) {
+    val c = LocalHg.current
+    Row(
+        Modifier.fillMaxWidth().clip(RoundedCornerShape(18.dp)).background(c.card).clickable(onClick = onClick).padding(horizontal = 16.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(
+            Modifier.size(44.dp).clip(RoundedCornerShape(14.dp)).background(c.soft),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(icon, null, tint = c.accent)
+        }
+        Spacer(Modifier.size(14.dp))
+        Column(Modifier.weight(1f)) {
+            Text(title, color = c.ink, fontFamily = Serif, fontSize = 18.sp)
+            Spacer(Modifier.height(2.dp))
+            Text(sub, color = c.muted, fontSize = 12.sp)
+        }
+        Icon(Icons.Filled.KeyboardArrowRight, null, tint = c.faint)
     }
 }
 
@@ -175,13 +289,13 @@ private fun Stat(label: String, value: String) {
 }
 
 @Composable
-private fun Seg(label: String, on: Boolean, modifier: Modifier = Modifier, click: () -> Unit) {
+private fun Seg(label: String, on: Boolean, modifier: Modifier = Modifier, dark: Boolean = false, click: () -> Unit) {
     val c = LocalHg.current
     Text(
         label,
-        color = if (on) c.onAccent else c.muted,
+        color = if (on) c.onAccent else if (dark) Color.White else c.muted,
         textAlign = TextAlign.Center,
-        modifier = modifier.clip(RoundedCornerShape(12.dp)).background(if (on) c.accent else c.card).clickable { click() }.padding(horizontal = 18.dp, vertical = 10.dp),
+        modifier = modifier.clip(RoundedCornerShape(12.dp)).background(if (on) c.accent else if (dark) Color.Transparent else c.card).clickable { click() }.padding(horizontal = 18.dp, vertical = 10.dp),
     )
 }
 

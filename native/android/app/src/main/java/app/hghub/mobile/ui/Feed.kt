@@ -4,13 +4,22 @@ import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.pm.ActivityInfo
+import android.graphics.drawable.ClipDrawable
+import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.InsetDrawable
+import android.graphics.drawable.LayerDrawable
+import android.os.SystemClock
+import android.view.Choreographer
+import android.view.Gravity
 import android.view.ViewGroup
+import android.widget.SeekBar
 import androidx.annotation.OptIn
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -20,6 +29,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
@@ -27,6 +37,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.pager.VerticalPager
 import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
@@ -38,11 +49,15 @@ import androidx.compose.material.icons.filled.FullscreenExit
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.filled.KeyboardArrowRight
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.outlined.List
 import androidx.compose.material.icons.outlined.StarOutline
 import androidx.compose.material.icons.outlined.VolumeOff
 import androidx.compose.material.icons.outlined.VolumeUp
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.ModalBottomSheet
@@ -68,6 +83,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -94,8 +110,11 @@ import app.hghub.mobile.data.Comment
 import app.hghub.mobile.data.Detail
 import app.hghub.mobile.data.fmtClock
 import app.hghub.mobile.data.fmtCount
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import androidx.compose.runtime.snapshotFlow
 
 private val speeds = floatArrayOf(1f, 1.25f, 1.5f, 2f)
 
@@ -109,6 +128,9 @@ fun VideoFeed(
     startTimeSec: Double,
     onBack: (() -> Unit)?,
     onNearEnd: (() -> Unit)?,
+    episodePaging: Boolean = false,
+    onEnterSeries: ((Int, Int) -> Unit)? = null,
+    progressOf: (Int) -> Pair<Int, Double>? = { null },
 ) {
     val app = LocalApp.current
     val context = LocalContext.current
@@ -118,9 +140,12 @@ fun VideoFeed(
         EmptyHint("暂无视频", "下拉列表为空", "返回", onBack)
         return
     }
+    var episodeTotal by remember {
+        mutableIntStateOf(maxOf(startEp, Library.get(ids.firstOrNull() ?: 0)?.episodeCount ?: 1, 1))
+    }
     val pager = rememberPagerState(
-        initialPage = start.coerceIn(0, ids.lastIndex),
-        pageCount = { ids.size },
+        initialPage = if (episodePaging) (startEp - 1).coerceAtLeast(0) else start.coerceIn(0, ids.lastIndex),
+        pageCount = { if (episodePaging) episodeTotal.coerceAtLeast(1) else ids.size.coerceAtLeast(1) },
     )
     val player = remember(base) {
         val headers = mapOf("Referer" to base.trimEnd('/') + "/", "Origin" to base.trimEnd('/'))
@@ -146,13 +171,28 @@ fun VideoFeed(
     var speedIndex by remember { mutableIntStateOf(0) }
     var sheet by remember { mutableStateOf<SheetKind?>(null) }
     var detail by remember { mutableStateOf<Detail?>(null) }
-    var ep by remember(ids.getOrNull(pager.currentPage)) { mutableIntStateOf(if (pager.currentPage == start) startEp.coerceAtLeast(1) else 1) }
+    var ep by remember(ids.getOrNull(pager.currentPage)) {
+        val saved = if (episodePaging) null else ids.getOrNull(pager.currentPage)?.let(progressOf)
+        mutableIntStateOf(
+            when {
+                pager.currentPage == start -> startEp.coerceAtLeast(1)
+                saved != null -> saved.first.coerceAtLeast(1)
+                else -> 1
+            },
+        )
+    }
+    var picked by remember(ids.getOrNull(if (episodePaging) 0 else pager.currentPage)) { mutableStateOf(false) }
+    var commentExtra by remember(if (episodePaging) ids.firstOrNull() else ids.getOrNull(pager.currentPage)) { mutableIntStateOf(0) }
     val comments = remember { androidx.compose.runtime.mutableStateListOf<Comment>() }
     var commentText by remember { mutableStateOf("") }
     var resume by remember { mutableStateOf(if (startTimeSec > 1) startTimeSec else 0.0) }
     var ticket by remember { mutableIntStateOf(0) }
     var fullscreen by remember { mutableStateOf(false) }
+    var chrome by remember { mutableStateOf(true) }
+    var chromeTick by remember { mutableIntStateOf(0) }
     var hevcUrl by remember { mutableStateOf("") }
+    var qualityKnown by remember { mutableStateOf(false) }
+    var playGen by remember { mutableIntStateOf(0) }
 
     DisposableEffect(player) {
         val listener = object : Player.Listener {
@@ -164,6 +204,8 @@ fun VideoFeed(
                 }
             }
             override fun onPlayerError(error: PlaybackException) {
+                val seen = playGen
+                if (seen != playGen) return
                 if (app.store.preferHevc && hevcUrl.isNotBlank()) {
                     val stay = player.currentPosition
                     if (stay > 300) resume = stay / 1000.0
@@ -197,20 +239,53 @@ fun VideoFeed(
             pos = player.currentPosition.coerceAtLeast(0L)
             val d = player.duration
             dur = if (d > 0) d else 0L
-            val id = ids.getOrNull(pager.currentPage) ?: 0
+            val id = if (episodePaging) ids.firstOrNull() ?: 0 else ids.getOrNull(pager.currentPage) ?: 0
+            val episode = if (episodePaging) pager.currentPage + 1 else ep
             if (id > 0 && dur > 0 && pos > 800) {
-                app.store.saveWatch(id, ep, pos / 1000.0, dur / 1000.0)
+                app.store.saveWatch(id, episode, pos / 1000.0, dur / 1000.0, keepFurther = !episodePaging && !picked)
             }
             delay(800)
         }
     }
 
-    LaunchedEffect(pager.currentPage, ids.size) {
-        if (pager.currentPage >= ids.size - 2) onNearEnd?.invoke()
+    LaunchedEffect(pager.currentPage, ids.size, episodePaging) {
+        if (!episodePaging && pager.currentPage >= ids.size - 2) onNearEnd?.invoke()
     }
 
-    val currentId = ids[pager.currentPage.coerceIn(0, ids.lastIndex)]
+    val currentId = if (episodePaging) ids.first() else ids[pager.currentPage.coerceIn(0, ids.lastIndex)]
+    val playingEp = if (episodePaging) pager.currentPage + 1 else ep
+
+    LaunchedEffect(episodePaging, startEp) {
+        if (!episodePaging) return@LaunchedEffect
+        val page = (startEp - 1).coerceIn(0, (episodeTotal - 1).coerceAtLeast(0))
+        if (pager.currentPage != page) pager.scrollToPage(page)
+    }
+
+    LaunchedEffect(currentId, playingEp, episodePaging) {
+        if (currentId <= 0 || !episodePaging) return@LaunchedEffect
+        delay(400)
+        if (pager.currentPage + 1 != playingEp) return@LaunchedEffect
+        val prev = app.store.history.firstOrNull { it.id == currentId }
+        val t = if (prev?.ep == playingEp) prev.t else 0.0
+        app.store.saveWatch(currentId, playingEp, t, prev?.dur ?: 0.0)
+    }
+
+    LaunchedEffect(pager.currentPage, episodePaging) {
+        if (episodePaging) return@LaunchedEffect
+        if (pager.currentPage == start) {
+            resume = if (startTimeSec > 1) startTimeSec else 0.0
+            return@LaunchedEffect
+        }
+        val saved = ids.getOrNull(pager.currentPage)?.let(progressOf)
+        resume = if (saved != null && saved.second > 1) saved.second else 0.0
+    }
     BackHandler(enabled = fullscreen) { fullscreen = false }
+
+    LaunchedEffect(fullscreen, chrome, chromeTick) {
+        if (!fullscreen || !chrome) return@LaunchedEffect
+        delay(3500)
+        chrome = false
+    }
 
     DisposableEffect(fullscreen) {
         val activity = context.findActivity()
@@ -237,30 +312,54 @@ fun VideoFeed(
         }
     }
 
-    LaunchedEffect(currentId, ep, base, ticket, app.store.preferHevc) {
-        failed = ""
-        buffering = true
-        val loaded = runCatching {
-            val d = app.api.video(currentId)
-            val play = app.api.play(currentId, ep)
-            d to play
-        }
-        val pair = loaded.getOrElse {
-            failed = it.message ?: "加载失败"
-            buffering = false
+    LaunchedEffect(currentId, playingEp, base, ticket, app.store.preferHevc) {
+        val id = currentId
+        val episode = playingEp
+        delay(180)
+        snapshotFlow { pager.isScrollInProgress }.first { !it }
+        if (episodePaging) {
+            if (pager.currentPage + 1 != episode) return@LaunchedEffect
+        } else if (ids.getOrNull(pager.currentPage) != id) {
             return@LaunchedEffect
         }
+        failed = ""
+        buffering = true
+        val pair = try {
+            val d = app.api.video(id)
+            val play = app.api.play(id, episode)
+            d to play
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            if (stillCurrent(episodePaging, pager.currentPage, ids, id, episode)) {
+                failed = e.message ?: "加载失败"
+                buffering = false
+            }
+            return@LaunchedEffect
+        }
+        if (!stillCurrent(episodePaging, pager.currentPage, ids, id, episode)) return@LaunchedEffect
         detail = pair.first
-        if (pair.first.liked && !app.store.isLiked(currentId)) app.store.toggleLike(currentId)
-        if (pair.first.collected && !app.store.isFav(currentId)) app.store.toggleFav(currentId)
+        if (episodePaging) {
+            val total = pair.first.episodes.size.takeIf { it > 0 } ?: pair.first.episodeCount
+            if (total > 0 && total != episodeTotal) episodeTotal = total
+            if (total > 0 && episode > total) {
+                pager.scrollToPage(total - 1)
+                return@LaunchedEffect
+            }
+        }
+        if (pair.first.liked && !app.store.isLiked(id)) app.store.toggleLike(id)
+        if (pair.first.collected && !app.store.isFav(id)) app.store.toggleFav(id)
         hevcUrl = pair.second.hevcUrl
+        qualityKnown = true
         val standard = pair.second.videoUrl.ifBlank { pair.first.videoUrl }
         val url = if (app.store.preferHevc && pair.second.hevcUrl.isNotBlank()) pair.second.hevcUrl else standard
+        if (!stillCurrent(episodePaging, pager.currentPage, ids, id, episode)) return@LaunchedEffect
         if (url.isBlank()) {
             failed = "没有可播放的地址"
             buffering = false
             return@LaunchedEffect
         }
+        playGen += 1
         player.setMediaItem(MediaItem.fromUri(url))
         player.prepare()
         player.playWhenReady = true
@@ -268,163 +367,54 @@ fun VideoFeed(
         player.volume = if (app.store.muted) 0f else 1f
     }
 
-    Box(Modifier.fillMaxSize().background(Color.Black)) {
-        VerticalPager(state = pager, modifier = Modifier.fillMaxSize()) { page ->
-            val id = ids[page]
-            val card = Library.get(id)
-            val active = page == pager.currentPage
-            Box(Modifier.fillMaxSize()) {
-                if (active) {
-                    AndroidView(
-                        factory = { ctx ->
-                            PlayerView(ctx).apply {
-                                useController = false
-                                this.player = player
-                                resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
-                                layoutParams = ViewGroup.LayoutParams(
-                                    ViewGroup.LayoutParams.MATCH_PARENT,
-                                    ViewGroup.LayoutParams.MATCH_PARENT,
-                                )
-                                setShutterBackgroundColor(android.graphics.Color.BLACK)
-                            }
-                        },
-                        modifier = Modifier.fillMaxSize(),
-                        update = {
-                            it.player = player
-                            it.resizeMode = if (fullscreen) {
-                                AspectRatioFrameLayout.RESIZE_MODE_FIT
-                            } else {
-                                AspectRatioFrameLayout.RESIZE_MODE_ZOOM
-                            }
-                        },
-                    )
-                } else {
-                    CoverImage(card?.cover.orEmpty(), Modifier.fillMaxSize(), 0.dp)
-                }
-                Box(
-                    Modifier.fillMaxSize().pointerInput(active) {
-                        if (!active) return@pointerInput
-                        detectTapGestures(onTap = {
-                            if (player.isPlaying) player.pause() else player.play()
-                        })
-                    },
-                )
-            }
-        }
-
-        Box(
-            Modifier.fillMaxWidth().height(160.dp).align(Alignment.BottomCenter).background(
-                Brush.verticalGradient(listOf(Color.Transparent, Color(0xCC000000))),
-            ),
-        )
-
-        val title = detail?.title ?: Library.get(currentId)?.title.orEmpty()
-        val desc = detail?.description ?: Library.get(currentId)?.description.orEmpty()
-        val tags = detail?.tags ?: Library.get(currentId)?.tags.orEmpty()
-
-        val fraction = if (dur > 0) (pos.toFloat() / dur.toFloat()).coerceIn(0f, 1f) else 0f
-        Column(
-            Modifier
-                .align(Alignment.BottomCenter)
-                .fillMaxWidth()
-                .then(if (onBack != null || fullscreen) Modifier.navigationBarsPadding() else Modifier)
-                .padding(bottom = if (fullscreen) 28.dp else 8.dp),
-        ) {
-            Box(
-                Modifier
-                    .padding(horizontal = 16.dp)
-                    .fillMaxWidth()
-                    .height(28.dp)
-                    .pointerInput(dur) {
-                        detectTapGestures { offset ->
-                            if (dur > 0) player.seekTo((offset.x / size.width * dur).toLong())
-                        }
-                    },
-            ) {
-                Box(Modifier.align(Alignment.CenterStart).fillMaxWidth().height(3.dp).background(Color(0x55FFFFFF)))
-                Box(Modifier.align(Alignment.CenterStart).fillMaxWidth(fraction).height(3.dp).background(Color(0xFFE08A6E)))
-            }
-            if (!fullscreen) {
-                Column(Modifier.padding(start = 16.dp, end = 72.dp, top = 6.dp, bottom = 8.dp)) {
-                    Text(title, color = Color.White, fontFamily = Serif, fontSize = 22.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                    if (tags.isNotEmpty()) {
-                        Spacer(Modifier.height(8.dp))
-                        Text(tags.take(3).joinToString("  ·  "), color = Color(0xFFE7D2C8), fontSize = 12.sp)
-                    }
-                    if (desc.isNotBlank()) {
-                        Spacer(Modifier.height(6.dp))
-                        Text(desc.replace('\n', ' '), color = Color(0xD9FFFFFF), fontSize = 13.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                    }
-                    Spacer(Modifier.height(8.dp))
-                    Text(
-                        "第 $ep 集   ${fmtClock(pos / 1000.0)} / ${fmtClock(dur / 1000.0)}",
-                        color = Color(0xCCFFFFFF),
-                        fontSize = 12.sp,
-                    )
-                }
-            }
-        }
-
-        if (!fullscreen) {
-        Column(
-            Modifier.align(Alignment.CenterEnd).navigationBarsPadding().padding(end = 10.dp, bottom = 72.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-        ) {
-            val liked = app.store.isLiked(currentId)
-            val faved = app.store.isFav(currentId)
-            RailButton(if (liked) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder, if (liked) Color(0xFFE08A6E) else Color.White, fmtCount(detail?.like ?: Library.get(currentId)?.likeCount ?: 0)) {
-                val on = app.store.toggleLike(currentId)
-                if (app.store.loggedIn) scope.launch { runCatching { app.api.like(currentId, ep, on) } }
-            }
-            RailButton(if (faved) Icons.Filled.Star else Icons.Outlined.StarOutline, if (faved) Color(0xFFE08A6E) else Color.White, "收藏") {
-                val on = app.store.toggleFav(currentId)
-                if (app.store.loggedIn) scope.launch { runCatching { app.api.collect(currentId, on) } }
-                app.store.show(if (on) "已收藏" else "已取消收藏")
-            }
-            RailButton(Icons.Outlined.List, Color.White, "选集") { sheet = SheetKind.Episodes }
-            RailButton(Icons.Outlined.ChatBubbleOutline, Color.White, "评论") {
-                sheet = SheetKind.Comments
-                scope.launch {
-                    comments.clear()
-                    runCatching { app.api.comments(currentId, ep, 1) }.onSuccess { comments.addAll(it.first) }
-                }
-            }
-        }
-        }
-
+    @Composable
+    fun TopControls() {
         Row(
-            Modifier.align(Alignment.TopStart).statusBarsPadding().padding(horizontal = 8.dp, vertical = 4.dp),
+            Modifier.fillMaxWidth().then(if (fullscreen) Modifier else Modifier.statusBarsPadding()).padding(horizontal = 8.dp, vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            if (onBack != null) {
-                Icon(Icons.Filled.ArrowBack, "返回", tint = Color.White, modifier = Modifier.size(40.dp).clickable { onBack() }.padding(8.dp))
+            if (fullscreen || onBack != null) {
+                Icon(
+                    Icons.Filled.ArrowBack,
+                    "返回",
+                    tint = Color.White,
+                    modifier = Modifier.size(40.dp).clickable {
+                        if (fullscreen) fullscreen = false else onBack?.invoke()
+                    }.padding(8.dp),
+                )
+                if (episodePaging || fullscreen) {
+                    Text("第 $playingEp 集", color = Color.White, fontFamily = Serif, fontSize = 18.sp)
+                }
             } else {
                 Text("HGhub", color = Color.White, fontFamily = Serif, fontSize = 22.sp, modifier = Modifier.padding(start = 8.dp))
             }
             Spacer(Modifier.weight(1f))
-            if (hevcUrl.isNotBlank()) {
-                Text(
-                    if (app.store.preferHevc) "高清" else "标准",
-                    color = Color.White,
-                    fontSize = 13.sp,
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(999.dp))
-                        .background(Color(0x66000000))
-                        .clickable {
-                            val stay = player.currentPosition
-                            if (stay > 300) resume = stay / 1000.0
-                            app.store.applyPreferHevc(!app.store.preferHevc)
-                        }
-                        .padding(horizontal = 12.dp, vertical = 6.dp),
-                )
-                Spacer(Modifier.width(8.dp))
-            }
+            QualityMenu(
+                preferHevc = app.store.preferHevc,
+                hevcReady = hevcUrl.isNotBlank(),
+                known = qualityKnown,
+                onPick = { wantHevc ->
+                    chromeTick += 1
+                    if (wantHevc && qualityKnown && hevcUrl.isBlank()) {
+                        app.store.show("这一集没有高清")
+                        return@QualityMenu
+                    }
+                    if (wantHevc == app.store.preferHevc) return@QualityMenu
+                    val stay = player.currentPosition
+                    if (stay > 300) resume = stay / 1000.0
+                    app.store.applyPreferHevc(wantHevc)
+                },
+            )
+            Spacer(Modifier.width(8.dp))
             Icon(
                 if (fullscreen) Icons.Filled.FullscreenExit else Icons.Filled.Fullscreen,
                 if (fullscreen) "退出全屏" else "全屏",
                 tint = Color.White,
-                modifier = Modifier.size(40.dp).clickable { fullscreen = !fullscreen }.padding(8.dp),
+                modifier = Modifier.size(40.dp).clickable {
+                    fullscreen = !fullscreen
+                    chrome = true
+                    chromeTick += 1
+                }.padding(8.dp),
             )
             Text(
                 "${speeds[speedIndex]}x",
@@ -436,6 +426,7 @@ fun VideoFeed(
                     .clickable {
                         speedIndex = (speedIndex + 1) % speeds.size
                         player.setPlaybackSpeed(speeds[speedIndex])
+                        chromeTick += 1
                     }
                     .padding(horizontal = 12.dp, vertical = 6.dp),
             )
@@ -448,19 +439,61 @@ fun VideoFeed(
                     val next = !app.store.muted
                     app.store.applyMuted(next)
                     player.volume = if (next) 0f else 1f
+                    chromeTick += 1
                 }.padding(8.dp),
             )
         }
+    }
 
+    @Composable
+    fun EpisodeBar(pickHere: Boolean) {
+        val total = if (episodePaging) {
+            episodeTotal.coerceAtLeast(1)
+        } else {
+            (detail?.episodeCount?.takeIf { it > 0 } ?: Library.get(currentId)?.episodeCount ?: playingEp).coerceAtLeast(1)
+        }
+        val label = if (episodePaging || pickHere) "选集 · 第 $playingEp 集 · 全 $total 集" else "选集 · 全 $total 集"
+        Row(
+            Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp)
+                .clip(RoundedCornerShape(12.dp))
+                .background(Color(0x22FFFFFF))
+                .clickable {
+                    if (pickHere || episodePaging || onEnterSeries == null) sheet = SheetKind.Episodes
+                    else onEnterSeries.invoke(currentId, playingEp)
+                    chromeTick += 1
+                }
+                .padding(horizontal = 14.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(Icons.Outlined.List, null, tint = Color.White)
+            Spacer(Modifier.width(8.dp))
+            Text(label, color = Color.White, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+            Icon(
+                if (episodePaging || pickHere) Icons.Filled.KeyboardArrowUp else Icons.Filled.KeyboardArrowRight,
+                null,
+                tint = Color.White,
+            )
+        }
+    }
+
+    @Composable
+    fun Status() {
         if (paused && failed.isBlank()) {
-            Icon(Icons.Filled.PlayArrow, null, tint = Color.White, modifier = Modifier.size(72.dp).align(Alignment.Center))
+            Icon(
+                Icons.Filled.PlayArrow,
+                "播放",
+                tint = Color.White,
+                modifier = Modifier.size(72.dp).clickable { player.play() },
+            )
         }
         if (buffering && failed.isBlank()) {
-            CircularProgressIndicator(color = Color(0xFFE08A6E), strokeWidth = 2.dp, modifier = Modifier.align(Alignment.Center))
+            CircularProgressIndicator(color = Color(0xFFE08A6E), strokeWidth = 2.dp)
         }
         if (failed.isNotBlank()) {
-            Column(Modifier.align(Alignment.Center).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                Text(failed, color = Color.White, fontSize = 14.sp)
+            Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(24.dp)) {
+                Text(failed, color = Color.White, fontSize = 14.sp, textAlign = TextAlign.Center)
                 Spacer(Modifier.height(12.dp))
                 Text(
                     "重试",
@@ -471,8 +504,153 @@ fun VideoFeed(
                 )
             }
         }
-
     }
+
+    val title = detail?.title ?: Library.get(currentId)?.title.orEmpty()
+    val desc = detail?.description ?: Library.get(currentId)?.description.orEmpty()
+    val tags = detail?.tags ?: Library.get(currentId)?.tags.orEmpty()
+
+    Box(Modifier.fillMaxSize().background(Color.Black)) {
+        Box(Modifier.fillMaxSize()) {
+                VerticalPager(state = pager, modifier = Modifier.fillMaxSize()) { page ->
+                    val id = if (episodePaging) currentId else ids.getOrNull(page) ?: currentId
+                    val card = Library.get(id)
+                    val active = page == pager.currentPage
+                    Box(Modifier.fillMaxSize()) {
+                        if (active) {
+                            AndroidView(
+                                factory = { ctx ->
+                                    PlayerView(ctx).apply {
+                                        useController = false
+                                        this.player = player
+                                        resizeMode = AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+                                        layoutParams = ViewGroup.LayoutParams(
+                                            ViewGroup.LayoutParams.MATCH_PARENT,
+                                            ViewGroup.LayoutParams.MATCH_PARENT,
+                                        )
+                                        setShutterBackgroundColor(android.graphics.Color.BLACK)
+                                    }
+                                },
+                                modifier = Modifier.fillMaxSize(),
+                                update = {
+                                    it.player = player
+                                    it.resizeMode = if (fullscreen) {
+                                        AspectRatioFrameLayout.RESIZE_MODE_FIT
+                                    } else {
+                                        AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+                                    }
+                                },
+                            )
+                        } else {
+                            CoverImage(card?.cover.orEmpty(), Modifier.fillMaxSize(), 0.dp)
+                        }
+                        Box(
+                            Modifier.fillMaxSize().pointerInput(active, fullscreen) {
+                                if (!active) return@pointerInput
+                                detectTapGestures(onTap = {
+                                    if (fullscreen) {
+                                        chrome = !chrome
+                                        if (chrome) chromeTick += 1
+                                    } else if (player.isPlaying) {
+                                        player.pause()
+                                    } else {
+                                        player.play()
+                                    }
+                                })
+                            },
+                        )
+                    }
+                }
+                if (!fullscreen) {
+                    Column(
+                        Modifier.align(Alignment.CenterEnd).padding(end = 10.dp, bottom = 210.dp),
+                        verticalArrangement = Arrangement.spacedBy(14.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                    ) {
+                        val liked = app.store.isLiked(currentId)
+                        val faved = app.store.isFav(currentId)
+                        RailButton(if (liked) Icons.Filled.Favorite else Icons.Outlined.FavoriteBorder, if (liked) Color(0xFFE08A6E) else Color.White, fmtCount(detail?.like ?: Library.get(currentId)?.likeCount ?: 0)) {
+                            val on = app.store.toggleLike(currentId)
+                            if (app.store.loggedIn) scope.launch { runCatching { app.api.like(currentId, playingEp, on) } }
+                        }
+                        RailButton(if (faved) Icons.Filled.Star else Icons.Outlined.StarOutline, if (faved) Color(0xFFE08A6E) else Color.White, "收藏") {
+                            val on = app.store.toggleFav(currentId)
+                            if (app.store.loggedIn) scope.launch { runCatching { app.api.collect(currentId, on) } }
+                            app.store.show(if (on) "已收藏" else "已取消收藏")
+                        }
+                        val commentLabel = if (detail == null && commentExtra == 0) "评论" else fmtCount((detail?.comment ?: 0) + commentExtra)
+                        RailButton(Icons.Outlined.ChatBubbleOutline, Color.White, commentLabel) {
+                            sheet = SheetKind.Comments
+                            scope.launch {
+                                comments.clear()
+                                runCatching { app.api.comments(currentId, playingEp, 1) }.onSuccess { comments.addAll(it.first) }
+                            }
+                        }
+                    }
+                }
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Status() }
+            }
+            if (!fullscreen) {
+                Box(
+                    Modifier.fillMaxWidth().height(220.dp).align(Alignment.BottomCenter).background(
+                        Brush.verticalGradient(listOf(Color.Transparent, Color(0xCC000000))),
+                    ),
+                )
+                Column(
+                    Modifier.align(Alignment.BottomCenter).then(if (onBack != null) Modifier.navigationBarsPadding() else Modifier),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    Text(
+                        "全屏观看",
+                        color = Color.White,
+                        fontSize = 14.sp,
+                        modifier = Modifier
+                            .padding(bottom = 10.dp)
+                            .clip(RoundedCornerShape(999.dp))
+                            .background(Color(0x73000000))
+                            .clickable {
+                                chrome = true
+                                chromeTick += 1
+                                fullscreen = true
+                            }
+                            .padding(horizontal = 14.dp, vertical = 8.dp),
+                    )
+                    if (!episodePaging) {
+                        Column(Modifier.fillMaxWidth().padding(start = 16.dp, end = 84.dp, bottom = 8.dp)) {
+                            Text(title, color = Color.White, fontFamily = Serif, fontSize = 22.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                            if (tags.isNotEmpty()) {
+                                Spacer(Modifier.height(8.dp))
+                                Text(tags.take(3).joinToString("  ·  "), color = Color(0xFFE7D2C8), fontSize = 12.sp)
+                            }
+                            if (desc.isNotBlank()) {
+                                Spacer(Modifier.height(6.dp))
+                                Text(desc.replace('\n', ' '), color = Color(0xD9FFFFFF), fontSize = 13.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                            }
+                        }
+                    }
+                    ProgressScrubber(player)
+                    EpisodeBar(pickHere = false)
+                    Spacer(Modifier.height(8.dp))
+                }
+                TopControls()
+            }
+        }
+        if (fullscreen && chrome) {
+            Column(Modifier.fillMaxSize().statusBarsPadding()) {
+                TopControls()
+                Box(
+                    Modifier.weight(1f).fillMaxWidth().pointerInput(Unit) {
+                        detectTapGestures { chrome = false }
+                    },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Status()
+                }
+                ProgressScrubber(player) { active -> if (active) chromeTick += 1 }
+                EpisodeBar(pickHere = true)
+                Spacer(Modifier.navigationBarsPadding().height(8.dp))
+            }
+        }
 
     if (sheet != null) {
         ModalBottomSheet(
@@ -481,10 +659,20 @@ fun VideoFeed(
             containerColor = LocalHg.current.paper,
         ) {
             when (sheet) {
-                SheetKind.Episodes -> EpisodeSheet(detail, ep) { next ->
+                SheetKind.Episodes -> EpisodeSheet(detail, playingEp) { next ->
                     sheet = null
                     resume = 0.0
-                    ep = next
+                    if (episodePaging) {
+                        scope.launch {
+                            pager.scrollToPage((next - 1).coerceIn(0, (episodeTotal - 1).coerceAtLeast(0)))
+                        }
+                    } else {
+                        picked = true
+                        ep = next
+                        val prev = app.store.history.firstOrNull { it.id == currentId }
+                        val t = if (prev?.ep == next) prev.t else 0.0
+                        app.store.saveWatch(currentId, next, t, prev?.dur ?: 0.0)
+                    }
                 }
                 SheetKind.Comments -> CommentSheet(comments, commentText, { commentText = it }) {
                     val text = commentText.trim()
@@ -494,11 +682,12 @@ fun VideoFeed(
                         return@CommentSheet
                     }
                     scope.launch {
-                        runCatching { app.api.sendComment(currentId, ep, text) }
+                        runCatching { app.api.sendComment(currentId, playingEp, text) }
                             .onSuccess {
                                 commentText = ""
+                                commentExtra += 1
                                 app.store.show("已发送")
-                                runCatching { app.api.comments(currentId, ep, 1) }.onSuccess {
+                                runCatching { app.api.comments(currentId, playingEp, 1) }.onSuccess {
                                     comments.clear()
                                     comments.addAll(it.first)
                                 }
@@ -526,6 +715,174 @@ private fun Context.findActivity(): Activity? {
 
 private const val HgApiUa =
     "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
+
+private fun stillCurrent(episodePaging: Boolean, page: Int, ids: List<Int>, id: Int, episode: Int): Boolean {
+    return if (episodePaging) page + 1 == episode else ids.getOrNull(page) == id
+}
+
+@Composable
+private fun ProgressScrubber(player: Player, onActive: (Boolean) -> Unit = {}) {
+    var label by remember { mutableStateOf<String?>(null) }
+    Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp)) {
+        Box(Modifier.fillMaxWidth().height(22.dp), contentAlignment = Alignment.Center) {
+            if (label != null) {
+                Text(label!!, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+            }
+        }
+        AndroidView(
+            factory = { ctx ->
+                ThickSeekBar(ctx).apply {
+                    setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                        override fun onProgressChanged(seekBar: SeekBar, progress: Int, fromUser: Boolean) {
+                            if (!fromUser) return
+                            val bar = seekBar as ThickSeekBar
+                            val duration = bar.player?.duration ?: 0L
+                            if (duration <= 0) return
+                            val target = duration * progress / seekBar.max
+                            label = fmtClock(target / 1000.0)
+                            onActive(true)
+                            val now = SystemClock.uptimeMillis()
+                            if (now - bar.lastSeekMs >= 40) {
+                                bar.lastSeekMs = now
+                                bar.player?.seekTo(target)
+                            }
+                        }
+
+                        override fun onStartTrackingTouch(seekBar: SeekBar) {
+                            (seekBar as ThickSeekBar).tracking = true
+                            seekBar.parent?.requestDisallowInterceptTouchEvent(true)
+                            onActive(true)
+                        }
+
+                        override fun onStopTrackingTouch(seekBar: SeekBar) {
+                            val bar = seekBar as ThickSeekBar
+                            bar.tracking = false
+                            val duration = bar.player?.duration ?: 0L
+                            if (duration > 0) bar.player?.seekTo(duration * seekBar.progress / seekBar.max)
+                            label = null
+                            onActive(false)
+                        }
+                    })
+                }
+            },
+            modifier = Modifier.fillMaxWidth().height(40.dp),
+            update = { it.player = player },
+        )
+    }
+}
+
+/** 系统 SeekBar：圆点跟手，播放进度按帧前进，不跟着整页重组。 */
+private class ThickSeekBar(context: android.content.Context) : SeekBar(context) {
+    var player: Player? = null
+    var tracking = false
+    var lastSeekMs = 0L
+
+    private val frame = object : Choreographer.FrameCallback {
+        override fun doFrame(frameTimeNanos: Long) {
+            val current = player
+            if (!tracking && current != null) {
+                val duration = current.duration
+                val position = current.currentPosition
+                if (duration > 0 && position >= 0) {
+                    val next = ((position.toDouble() / duration) * max).toInt().coerceIn(0, max)
+                    if (progress != next) progress = next
+                }
+            }
+            Choreographer.getInstance().postFrameCallback(this)
+        }
+    }
+
+    init {
+        max = 1000
+        splitTrack = false
+        isDuplicateParentStateEnabled = false
+        val trackHeight = (10 * resources.displayMetrics.density).toInt().coerceAtLeast(8)
+        val thumbSize = (24 * resources.displayMetrics.density).toInt()
+        val background = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = trackHeight / 2f
+            setColor(0x66FFFFFF)
+            setSize(trackHeight, trackHeight)
+        }
+        val played = GradientDrawable().apply {
+            shape = GradientDrawable.RECTANGLE
+            cornerRadius = trackHeight / 2f
+            setColor(0xFFE08A6E.toInt())
+            setSize(trackHeight, trackHeight)
+        }
+        val layers = LayerDrawable(arrayOf(background, ClipDrawable(played, Gravity.START, ClipDrawable.HORIZONTAL)))
+        layers.setId(0, android.R.id.background)
+        layers.setId(1, android.R.id.progress)
+        val inset = (15 * resources.displayMetrics.density).toInt()
+        progressDrawable = InsetDrawable(layers, 0, inset, 0, inset)
+        thumb = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(0xFFFFFFFF.toInt())
+            setSize(thumbSize, thumbSize)
+        }
+        thumbOffset = thumbSize / 2
+        val pad = thumbSize / 2
+        setPadding(pad, 0, pad, 0)
+        minimumHeight = thumbSize
+    }
+
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        Choreographer.getInstance().postFrameCallback(frame)
+    }
+
+    override fun onDetachedFromWindow() {
+        Choreographer.getInstance().removeFrameCallback(frame)
+        super.onDetachedFromWindow()
+    }
+}
+
+@Composable
+private fun QualityMenu(
+    preferHevc: Boolean,
+    hevcReady: Boolean,
+    known: Boolean,
+    onPick: (Boolean) -> Unit,
+) {
+    var open by remember { mutableStateOf(false) }
+    val playingHevc = preferHevc && (hevcReady || !known)
+    Box {
+        Text(
+            if (playingHevc) "高清" else "标准",
+            color = Color.White,
+            fontSize = 13.sp,
+            modifier = Modifier
+                .clip(RoundedCornerShape(999.dp))
+                .background(Color(0x66000000))
+                .clickable { open = true }
+                .padding(horizontal = 12.dp, vertical = 6.dp),
+        )
+        DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            DropdownMenuItem(
+                text = { Text(if (playingHevc) "标准" else "标准  ✓") },
+                onClick = {
+                    open = false
+                    onPick(false)
+                },
+            )
+            DropdownMenuItem(
+                text = {
+                    Text(
+                        when {
+                            known && !hevcReady -> "高清（这一集没有）"
+                            playingHevc -> "高清  ✓"
+                            else -> "高清"
+                        },
+                    )
+                },
+                onClick = {
+                    open = false
+                    onPick(true)
+                },
+            )
+        }
+    }
+}
 
 @Composable
 private fun RailButton(
@@ -617,7 +974,7 @@ private fun CommentSheet(
 }
 
 @Composable
-fun HomeFeed(onOpenSearch: () -> Unit) {
+fun HomeFeed(onOpenSearch: () -> Unit, onEnterSeries: (Int, Int) -> Unit = { _, _ -> }) {
     val app = LocalApp.current
     val scope = rememberCoroutineScope()
     var items by remember { mutableStateOf(HomeCache.items) }
@@ -663,6 +1020,7 @@ fun HomeFeed(onOpenSearch: () -> Unit) {
             onNearEnd = {
                 if (!loading && !done) scope.launch { load(page + 1) }
             },
+            onEnterSeries = onEnterSeries,
         )
     }
     if (false) onOpenSearch()

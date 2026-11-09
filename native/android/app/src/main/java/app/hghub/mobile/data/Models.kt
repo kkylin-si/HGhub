@@ -182,7 +182,7 @@ fun JSONObject.toDetail(): Detail {
         episodes = episodes,
         like = counts?.int("like") ?: int("like_count"),
         collect = counts?.int("collect") ?: int("collect_count"),
-        comment = counts?.int("comment") ?: int("comment_count"),
+        comment = counts?.int("comment") ?: obj("metrics")?.int("comment") ?: int("comment_count"),
         author = author(),
         liked = interaction?.bool("liked") == true,
         collected = interaction?.bool("collected") == true,

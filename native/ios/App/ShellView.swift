@@ -2,10 +2,12 @@ import SwiftUI
 
 enum Route: Hashable {
     case feed(ids: [Int], index: Int, ep: Int, time: Double)
+    case series(id: Int, ep: Int, time: Double)
     case channel(String, String)
     case ranks
     case posts
     case post(Int)
+    case library(String)
     case settings
 }
 
@@ -22,7 +24,7 @@ struct ShellView: View {
                     route(top)
                 } else {
                     switch tab {
-                    case 0: HomeFeed()
+                    case 0: HomeFeed(openSeries: { id, ep in enterSeries(id, ep, 0) })
                     case 1: SearchScreen(open: pushFeed, ranks: { stack.append(.ranks) })
                     case 2: CategoryScreen(
                         channel: { stack.append(.channel($0, $1)) },
@@ -33,7 +35,7 @@ struct ShellView: View {
                     default: ProfileScreen(
                         settings: { stack.append(.settings) },
                         login: { model.loginOpen = true },
-                        open: { id, ep, time in stack.append(.feed(ids: [id], index: 0, ep: ep, time: time)) }
+                        library: { stack.append(.library($0)) }
                     )
                     }
                 }
@@ -61,6 +63,7 @@ struct ShellView: View {
 
     private var isFeed: Bool {
         if case .feed = stack.last { return true }
+        if case .series = stack.last { return true }
         return false
     }
 
@@ -68,7 +71,12 @@ struct ShellView: View {
     private func route(_ top: Route) -> some View {
         switch top {
         case let .feed(ids, index, ep, time):
-            FeedScreen(ids: ids, start: index, startEp: ep, startTime: time, onBack: pop)
+            FeedScreen(ids: ids, start: index, startEp: ep, startTime: time, onBack: pop, onEnterSeries: { id, ep in
+                enterSeries(id, ep, 0)
+            })
+        case let .series(id, ep, time):
+            FeedScreen(ids: [id], start: 0, startEp: ep, startTime: time, episodePaging: true, onBack: pop)
+                .id("series-\(id)-\(ep)")
         case let .channel(cate, name):
             ChannelScreen(cate: cate, name: name, back: pop, open: pushFeed)
         case .ranks:
@@ -77,6 +85,13 @@ struct ShellView: View {
             PostsScreen(back: pop) { stack.append(.post($0)) }
         case let .post(id):
             PostScreen(id: id, back: pop)
+        case let .library(kind):
+            LibraryScreen(
+                kind: kind,
+                back: pop,
+                open: { id, ep, time in enterSeries(id, ep, time) },
+                series: { id, ep in enterSeries(id, ep, 0) }
+            )
         case .settings:
             SettingsScreen(back: pop)
         }
@@ -86,6 +101,10 @@ struct ShellView: View {
 
     private func pushFeed(_ ids: [Int], _ index: Int) {
         stack.append(.feed(ids: ids, index: index, ep: 1, time: 0))
+    }
+
+    private func enterSeries(_ id: Int, _ ep: Int, _ time: Double = 0) {
+        stack.append(.series(id: id, ep: max(ep, 1), time: time))
     }
 
     private var tabBar: some View {

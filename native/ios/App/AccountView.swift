@@ -3,17 +3,14 @@ import SwiftUI
 struct ProfileScreen: View {
     var settings: () -> Void
     var login: () -> Void
-    var open: (Int, Int, Double) -> Void
+    var library: (String) -> Void
     @EnvironmentObject private var model: AppModel
     @Environment(\.hg) private var hg
-    @State private var tab = "fav"
-    @State private var cards: [Detail] = []
 
     var body: some View {
-        let ids = tab == "fav" ? model.favs : model.history.map(\.id)
         let name = model.account?.nickname ?? "未登录"
         ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 16) {
                 HStack(alignment: .center) {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("我的").font(.hgTitle(34)).foregroundStyle(hg.ink)
@@ -65,59 +62,15 @@ struct ProfileScreen: View {
                 .clipShape(RoundedRectangle(cornerRadius: 22))
                 .padding(.horizontal, 20)
 
-                HStack(spacing: 4) {
-                    seg("收藏", tab == "fav") { tab = "fav" }
-                    seg("历史", tab == "history") { tab = "history" }
+                VStack(spacing: 10) {
+                    entry("star", "收藏", "\(model.favs.count) 部") { library("fav") }
+                    entry("clock.arrow.circlepath", "观看历史", "\(model.history.count) 部") { library("history") }
                 }
-                .padding(4)
-                .background(hg.card)
-                .clipShape(RoundedRectangle(cornerRadius: 16))
                 .padding(.horizontal, 20)
-
-                if cards.isEmpty {
-                    VStack(spacing: 6) {
-                        Text(ids.isEmpty ? (tab == "fav" ? "还没有收藏" : "还没有观看记录") : "正在读取…")
-                            .font(.hgTitle(18)).foregroundStyle(hg.ink)
-                        Text(ids.isEmpty ? (tab == "fav" ? "看到喜欢的短剧，点一下收藏" : "看过的剧会记在这里") : "稍等一下")
-                            .font(.subheadline).foregroundStyle(hg.muted)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 36)
-                }
-                ForEach(cards, id: \.id) { item in
-                    let progress = model.history.first { $0.id == item.id }
-                    Button {
-                        open(item.id, progress?.ep ?? 1, tab == "history" ? (progress?.t ?? 0) : 0)
-                    } label: {
-                        HStack(spacing: 12) {
-                            CoverView(url: item.cover).frame(width: 64, height: 86).clipShape(RoundedRectangle(cornerRadius: 12))
-                            VStack(alignment: .leading, spacing: 6) {
-                                Text(item.title).font(.hgTitle(16)).foregroundStyle(hg.ink).lineLimit(2)
-                                Text(tab == "history" && progress != nil ? "看到第 \(progress!.ep) 集 \(fmtClock(progress!.t))" : "\(item.episodes.count) 集")
-                                    .font(.caption).foregroundStyle(hg.muted)
-                            }
-                            Spacer()
-                            Image(systemName: "chevron.right").font(.caption).foregroundStyle(hg.faint)
-                        }
-                        .padding(12)
-                        .background(hg.card)
-                        .clipShape(RoundedRectangle(cornerRadius: 18))
-                    }
-                    .padding(.horizontal, 20)
-                }
             }
             .padding(.bottom, 24)
         }
         .background(hg.paper)
-        .task(id: ids) { await reload(ids) }
-    }
-
-    private func reload(_ ids: [Int]) async {
-        var loaded: [Detail] = []
-        for id in ids.prefix(16) {
-            if let detail = try? await model.api.video(id) { loaded.append(detail) }
-        }
-        cards = loaded
     }
 
     private func stat(_ label: String, _ value: String) -> some View {
@@ -128,17 +81,149 @@ struct ProfileScreen: View {
         .frame(maxWidth: .infinity)
     }
 
-    private func seg(_ label: String, _ on: Bool, action: @escaping () -> Void) -> some View {
+    private func entry(_ icon: String, _ title: String, _ sub: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            Text(label)
-                .font(.subheadline)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 10)
+            HStack(spacing: 14) {
+                Image(systemName: icon)
+                    .font(.system(size: 18, weight: .medium))
+                    .foregroundStyle(hg.accent)
+                    .frame(width: 44, height: 44)
+                    .background(hg.soft)
+                    .clipShape(RoundedRectangle(cornerRadius: 14))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title).font(.hgTitle(18)).foregroundStyle(hg.ink)
+                    Text(sub).font(.caption).foregroundStyle(hg.muted)
+                }
+                Spacer()
+                Image(systemName: "chevron.right").font(.caption).foregroundStyle(hg.faint)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 14)
+            .background(hg.card)
+            .clipShape(RoundedRectangle(cornerRadius: 18))
         }
-        .foregroundStyle(on ? hg.onAccent : hg.muted)
-        .background(on ? hg.accent : hg.card)
-        .clipShape(RoundedRectangle(cornerRadius: 12))
     }
+}
+
+struct LibraryScreen: View {
+    var kind: String
+    var back: () -> Void
+    var open: (Int, Int, Double) -> Void
+    var series: (Int, Int) -> Void
+    @EnvironmentObject private var model: AppModel
+    @Environment(\.hg) private var hg
+    @State private var cards: [Detail] = []
+    @State private var swipe = false
+
+    var body: some View {
+        let ids = kind == "fav" ? model.favs : model.history.map(\.id)
+        let title = kind == "fav" ? "收藏" : "观看历史"
+        VStack(alignment: .leading, spacing: 8) {
+            if swipe {
+                HStack {
+                    Button(action: back) {
+                        Image(systemName: "chevron.left").foregroundStyle(.white).frame(width: 40, height: 40)
+                    }
+                    Text(title).font(.hgTitle(22)).foregroundStyle(.white)
+                    Spacer()
+                    Button { swipe = false } label: {
+                        Text("列表").font(.subheadline).foregroundStyle(.white)
+                            .padding(.horizontal, 14).padding(.vertical, 8)
+                            .background(Color.white.opacity(0.12))
+                            .clipShape(RoundedRectangle(cornerRadius: 12))
+                    }
+                }
+                .padding(.horizontal, 12)
+                if ids.isEmpty {
+                    VStack(spacing: 6) {
+                        Text(kind == "fav" ? "还没有收藏" : "还没有观看记录")
+                            .font(.hgTitle(18)).foregroundStyle(.white)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    FeedScreen(
+                        ids: ids,
+                        start: 0,
+                        startEp: kind == "history" ? (model.history.first?.ep ?? 1) : 1,
+                        startTime: kind == "history" ? (model.history.first?.t ?? 0) : 0,
+                        showsBack: false,
+                        onEnterSeries: series,
+                        progressFor: { id in
+                            guard kind == "history", let watch = model.history.first(where: { $0.id == id }) else { return nil }
+                            return (ep: watch.ep, time: watch.t)
+                        }
+                    )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+            } else {
+                PageHeader(title: title, sub: kind == "fav" ? "看到喜欢的短剧会留在这里" : "看过的剧会记在这里", back: back)
+                HStack {
+                    Spacer()
+                    Button { swipe = true } label: {
+                        Text("滑动").font(.subheadline).foregroundStyle(hg.ink)
+                            .padding(.horizontal, 14).padding(.vertical, 8)
+                            .background(hg.card)
+                            .clipShape(RoundedRectangle(cornerRadius: 12))
+                    }
+                }
+                .padding(.horizontal, 20)
+                ScrollView {
+                    VStack(spacing: 12) {
+                        if cards.isEmpty {
+                            VStack(spacing: 6) {
+                                Text(ids.isEmpty ? (kind == "fav" ? "还没有收藏" : "还没有观看记录") : "正在读取…")
+                                    .font(.hgTitle(18)).foregroundStyle(hg.ink)
+                                Text(ids.isEmpty ? (kind == "fav" ? "看到喜欢的短剧，点一下收藏" : "看过的剧会记在这里") : "稍等一下")
+                                    .font(.subheadline).foregroundStyle(hg.muted)
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 36)
+                        }
+                        ForEach(cards, id: \.id) { item in
+                            let progress = model.history.first { $0.id == item.id }
+                            let epName = item.episodes.first { $0.ep == progress?.ep }?.title ?? ""
+                            let named = progress != nil && !epName.isEmpty && epName != "第\(progress!.ep)集"
+                            Button {
+                                open(item.id, progress?.ep ?? 1, kind == "history" ? (progress?.t ?? 0) : 0)
+                            } label: {
+                                HStack(spacing: 12) {
+                                    CoverView(url: item.cover).frame(width: 64, height: 86).clipShape(RoundedRectangle(cornerRadius: 12))
+                                    VStack(alignment: .leading, spacing: 6) {
+                                        Text(item.title).font(.hgTitle(16)).foregroundStyle(hg.ink).lineLimit(2)
+                                        Text(historyLine(kind: kind, episodes: item.episodes.count, progress: progress, epName: named ? epName : ""))
+                                            .font(.caption).foregroundStyle(hg.muted)
+                                    }
+                                    Spacer()
+                                    Image(systemName: "chevron.right").font(.caption).foregroundStyle(hg.faint)
+                                }
+                                .padding(12)
+                                .background(hg.card)
+                                .clipShape(RoundedRectangle(cornerRadius: 18))
+                            }
+                            .padding(.horizontal, 20)
+                        }
+                    }
+                    .padding(.bottom, 24)
+                }
+            }
+        }
+        .background(swipe ? Color.black : hg.paper)
+        .task(id: ids) { await reload(ids) }
+    }
+
+    private func reload(_ ids: [Int]) async {
+        var loaded: [Detail] = []
+        for id in ids.prefix(16) {
+            if let detail = try? await model.api.video(id) { loaded.append(detail) }
+        }
+        cards = loaded
+    }
+}
+
+private func historyLine(kind: String, episodes: Int, progress: Watch?, epName: String) -> String {
+    guard kind == "history", let progress else { return "\(episodes) 集" }
+    if epName.isEmpty { return "第 \(progress.ep) 集 · 看到 \(fmtClock(progress.t))" }
+    return "第 \(progress.ep) 集 · \(epName) · 看到 \(fmtClock(progress.t))"
 }
 
 struct SettingsScreen: View {

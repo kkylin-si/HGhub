@@ -24,6 +24,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -41,10 +42,12 @@ private enum class Tab { Home, Search, Category, Profile }
 
 private sealed interface Route {
     data class Feed(val ids: List<Int>, val index: Int, val ep: Int, val time: Double) : Route
+    data class Series(val id: Int, val ep: Int, val time: Double) : Route
     data class Channel(val cate: String, val name: String) : Route
     data object Ranks : Route
     data object Posts : Route
     data class PostDetail(val id: Int) : Route
+    data class Library(val kind: String) : Route
     data object Settings : Route
 }
 
@@ -65,10 +68,23 @@ fun Shell() {
         }
     }
 
-    Column(Modifier.fillMaxSize().background(if (top is Route.Feed || (top == null && tab == Tab.Home)) androidx.compose.ui.graphics.Color.Black else c.paper)) {
+    Column(Modifier.fillMaxSize().background(if (top is Route.Feed || top is Route.Series || (top == null && tab == Tab.Home)) androidx.compose.ui.graphics.Color.Black else c.paper)) {
         Box(Modifier.weight(1f).fillMaxWidth()) {
             when (top) {
-                is Route.Feed -> VideoFeed(top.ids, top.index, top.ep, top.time, onBack = { stack = stack.dropLast(1) }, onNearEnd = null)
+                is Route.Feed -> VideoFeed(
+                    top.ids, top.index, top.ep, top.time,
+                    onBack = { stack = stack.dropLast(1) },
+                    onNearEnd = null,
+                    onEnterSeries = { id, ep -> stack = stack + Route.Series(id, ep, 0.0) },
+                )
+                is Route.Series -> key(top.id, top.ep) {
+                    VideoFeed(
+                        listOf(top.id), 0, top.ep, top.time,
+                        onBack = { stack = stack.dropLast(1) },
+                        onNearEnd = null,
+                        episodePaging = true,
+                    )
+                }
                 is Route.Channel -> ChannelScreen(top.cate, top.name, { stack = stack.dropLast(1) }) { ids, index ->
                     stack = stack + Route.Feed(ids, index, 1, 0.0)
                 }
@@ -79,9 +95,15 @@ fun Shell() {
                     stack = stack + Route.PostDetail(id)
                 }
                 is Route.PostDetail -> PostScreen(top.id) { stack = stack.dropLast(1) }
+                is Route.Library -> LibraryScreen(
+                    kind = top.kind,
+                    onBack = { stack = stack.dropLast(1) },
+                    onOpen = { id, ep, time -> stack = stack + Route.Series(id, ep, time) },
+                    onSeries = { id, ep -> stack = stack + Route.Series(id, ep, 0.0) },
+                )
                 Route.Settings -> SettingsScreen { stack = stack.dropLast(1) }
                 null -> when (tab) {
-                    Tab.Home -> HomeFeed {}
+                    Tab.Home -> HomeFeed({}, onEnterSeries = { id, ep -> stack = stack + Route.Series(id, ep, 0.0) })
                     Tab.Search -> SearchScreen(
                         onOpen = { ids, index -> stack = stack + Route.Feed(ids, index, 1, 0.0) },
                         onRanks = { stack = stack + Route.Ranks },
@@ -95,7 +117,7 @@ fun Shell() {
                     Tab.Profile -> ProfileScreen(
                         onSettings = { stack = stack + Route.Settings },
                         onLogin = { login = true },
-                        onOpen = { id, ep, time -> stack = stack + Route.Feed(listOf(id), 0, ep, time) },
+                        onLibrary = { kind -> stack = stack + Route.Library(kind) },
                     )
                 }
             }

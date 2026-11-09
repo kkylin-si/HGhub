@@ -62,14 +62,154 @@ final class PlayerHost: UIView {
     var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
 }
 
+/// 系统 UISlider：拖动时圆点跟手，播放时按屏幕刷新往前走。
+struct NativeScrubber: UIViewRepresentable {
+    let player: AVPlayer
+    var accent: UIColor
+    var onLabel: (String?) -> Void
+
+    func makeUIView(context: Context) -> ScrubberBar {
+        let bar = ScrubberBar()
+        bar.onLabel = onLabel
+        bar.player = player
+        bar.apply(accent: accent)
+        return bar
+    }
+
+    func updateUIView(_ uiView: ScrubberBar, context: Context) {
+        uiView.onLabel = onLabel
+        uiView.player = player
+        uiView.apply(accent: accent)
+    }
+
+    static func dismantleUIView(_ uiView: ScrubberBar, coordinator: ()) {
+        uiView.stop()
+    }
+}
+
+final class ScrubberBar: UIView {
+    let slider = ThickSlider()
+    var onLabel: ((String?) -> Void)?
+    weak var player: AVPlayer?
+    private var link: CADisplayLink?
+    private var lastSeek: CFTimeInterval = 0
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        slider.minimumValue = 0
+        slider.maximumValue = 1
+        slider.isContinuous = true
+        slider.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(slider)
+        NSLayoutConstraint.activate([
+            slider.leadingAnchor.constraint(equalTo: leadingAnchor),
+            slider.trailingAnchor.constraint(equalTo: trailingAnchor),
+            slider.centerYAnchor.constraint(equalTo: centerYAnchor),
+            slider.heightAnchor.constraint(equalToConstant: 40),
+        ])
+        slider.addTarget(self, action: #selector(changed), for: .valueChanged)
+        slider.addTarget(self, action: #selector(ended), for: [.touchUpInside, .touchUpOutside, .touchCancel])
+        let link = CADisplayLink(target: self, selector: #selector(tick))
+        link.add(to: .main, forMode: .common)
+        self.link = link
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    private var appliedAccent: UIColor?
+
+    func apply(accent: UIColor) {
+        if appliedAccent?.isEqual(accent) == true { return }
+        appliedAccent = accent
+        slider.minimumTrackTintColor = accent
+        slider.maximumTrackTintColor = UIColor.white.withAlphaComponent(0.35)
+        slider.setThumbImage(ScrubberBar.thumb, for: .normal)
+        slider.setMinimumTrackImage(ScrubberBar.track(accent), for: .normal)
+        slider.setMaximumTrackImage(ScrubberBar.track(UIColor.white.withAlphaComponent(0.35)), for: .normal)
+    }
+
+    func stop() {
+        link?.invalidate()
+        link = nil
+    }
+
+    deinit { stop() }
+
+    @objc private func tick() {
+        guard !slider.isTracking, let item = player?.currentItem else { return }
+        let duration = item.duration.seconds
+        let position = player?.currentTime().seconds ?? 0
+        guard duration.isFinite, duration > 0, position.isFinite else { return }
+        slider.setValue(Float(min(max(position / duration, 0), 1)), animated: false)
+    }
+
+    @objc private func changed() {
+        guard slider.isTracking else { return }
+        seek(exact: false)
+    }
+
+    @objc private func ended() {
+        seek(exact: true)
+        onLabel?(nil)
+    }
+
+    private func seek(exact: Bool) {
+        guard let player, let item = player.currentItem else { return }
+        let duration = item.duration.seconds
+        guard duration.isFinite, duration > 0 else { return }
+        let seconds = Double(slider.value) * duration
+        onLabel?(fmtClock(seconds))
+        let now = CACurrentMediaTime()
+        if !exact && now - lastSeek < 0.05 { return }
+        lastSeek = now
+        let time = CMTime(seconds: seconds, preferredTimescale: 600)
+        if exact {
+            player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
+        } else {
+            player.seek(to: time, toleranceBefore: .positiveInfinity, toleranceAfter: .positiveInfinity)
+        }
+    }
+
+    private static let thumb: UIImage = {
+        let side: CGFloat = 24
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: side, height: side))
+        return renderer.image { _ in
+            UIColor.white.setFill()
+            UIBezierPath(ovalIn: CGRect(x: 0, y: 0, width: side, height: side)).fill()
+        }
+    }()
+
+    private static func track(_ color: UIColor) -> UIImage {
+        let height: CGFloat = 10
+        let width: CGFloat = 12
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: width, height: height))
+        let image = renderer.image { _ in
+            color.setFill()
+            UIBezierPath(roundedRect: CGRect(x: 0, y: 0, width: width, height: height), cornerRadius: height / 2).fill()
+        }
+        return image.resizableImage(withCapInsets: UIEdgeInsets(top: 0, left: 5, bottom: 0, right: 5), resizingMode: .stretch)
+    }
+}
+
+final class ThickSlider: UISlider {
+    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
+        bounds.insetBy(dx: -8, dy: -16).contains(point)
+    }
+}
+
 struct FeedScreen: View {
     let ids: [Int]
     let start: Int
     var startEp: Int = 1
     var startTime: Double = 0
     var showsBack: Bool = true
+    /// 为真时上下滑切换的是这一部的集，而不是下一部剧。
+    var episodePaging = false
     var onBack: () -> Void = {}
     var onNearEnd: () -> Void = {}
+    var onEnterSeries: ((Int, Int) -> Void)? = nil
+    /// 历史滑动时，每部剧回到自己记下的集数和进度。
+    var progressFor: (Int) -> (ep: Int, time: Double)? = { _ in nil }
 
     @EnvironmentObject private var model: AppModel
     @EnvironmentObject private var proxy: MediaProxy
@@ -85,64 +225,117 @@ struct FeedScreen: View {
     @State private var ticket = 0
     @State private var resume = 0.0
     @State private var fullscreen = false
+    @State private var chrome = true
+    @State private var hideChrome: Task<Void, Never>?
+    @State private var scrubLabel: String?
     @State private var hevcAvailable = false
+    @State private var qualityKnown = false
+    @State private var playTask: Task<Void, Never>?
+    @State private var picked = false
+    @State private var commentExtra = 0
 
     private let speeds: [Float] = [1, 1.25, 1.5, 2]
 
     var body: some View {
         let id = ids.indices.contains(index) ? ids[index] : 0
-        ZStack {
-            Color.black.ignoresSafeArea()
-            PlayerSurface(player: box.player, fill: !fullscreen).ignoresSafeArea()
-            LinearGradient(colors: [.clear, .black.opacity(fullscreen ? 0.35 : 0.72)], startPoint: .center, endPoint: .bottom)
-                .ignoresSafeArea()
-                .allowsHitTesting(false)
-            VStack(spacing: 0) {
-                topBar
-                Spacer()
-                progress
-                    .padding(.horizontal, 16)
-                    .padding(.bottom, 10)
-                if !fullscreen {
-                    HStack(alignment: .bottom) {
-                        caption(id)
-                        rail(id)
+        GeometryReader { _ in
+            ZStack {
+                Color.black
+                if fullscreen {
+                    PlayerSurface(player: box.player, fill: false).ignoresSafeArea()
+                    Color.clear
+                        .contentShape(Rectangle())
+                        .onTapGesture { toggleChrome() }
+                        .gesture(episodeSwipe)
+                    if chrome {
+                        VStack(spacing: 0) {
+                            topBar
+                            Spacer()
+                            progress.padding(.horizontal, 12)
+                            episodeBar(id, pickHere: true)
+                                .padding(.horizontal, 16)
+                                .padding(.top, 6)
+                                .padding(.bottom, 16)
+                        }
                     }
-                    .padding(.horizontal, 16)
-                }
-                Color.clear.frame(height: fullscreen ? 64 : 48)
-            }
-            if box.waiting && box.failed.isEmpty {
-                ProgressView().tint(hg.accent)
-            }
-            if box.paused && box.failed.isEmpty {
-                Image(systemName: "play.fill").font(.system(size: 42)).foregroundStyle(.white)
-            }
-            if !box.failed.isEmpty {
-                VStack(spacing: 12) {
-                    Text(box.failed).foregroundStyle(.white).font(.subheadline)
-                    Button("重试") { ticket += 1 }
-                        .padding(.horizontal, 16).padding(.vertical, 8)
-                        .background(hg.accent).foregroundStyle(hg.onAccent).clipShape(RoundedRectangle(cornerRadius: 12))
+                    playbackStatus
+                } else {
+                    PlayerSurface(player: box.player, fill: true)
+                        .ignoresSafeArea()
+                    LinearGradient(colors: [.clear, .black.opacity(0.72)], startPoint: .center, endPoint: .bottom)
+                        .ignoresSafeArea()
+                        .allowsHitTesting(false)
+                    Color.clear
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            if box.player.timeControlStatus == .playing { box.player.pause() } else { box.player.play() }
+                        }
+                        .gesture(episodeSwipe)
+                    VStack(spacing: 0) {
+                        topBar
+                        Spacer()
+                        HStack {
+                            Spacer()
+                            rail(id)
+                                .padding(.trailing, 10)
+                                .padding(.bottom, 12)
+                        }
+                        Button {
+                            chrome = true
+                            fullscreen = true
+                        } label: {
+                            Label("全屏观看", systemImage: "arrow.up.left.and.arrow.down.right")
+                                .font(.subheadline.weight(.medium))
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 14).padding(.vertical, 8)
+                                .background(.black.opacity(0.45))
+                                .clipShape(Capsule())
+                        }
+                        .padding(.bottom, 12)
+                        if !episodePaging {
+                            caption(id)
+                                .padding(.horizontal, 16)
+                                .padding(.trailing, 64)
+                                .padding(.bottom, 6)
+                        }
+                        progress.padding(.horizontal, 12)
+                        episodeBar(id)
+                            .padding(.horizontal, 12)
+                            .padding(.top, 6)
+                            .padding(.bottom, 8)
+                    }
+                    playbackStatus
                 }
             }
         }
-        .contentShape(Rectangle())
-        .onTapGesture {
-            if box.player.timeControlStatus == .playing { box.player.pause() } else { box.player.play() }
-        }
-        .gesture(DragGesture(minimumDistance: 24).onEnded { value in
-            if value.translation.height < -70 { step(1) }
-            if value.translation.height > 70 { step(-1) }
-        })
+        .background(Color.black)
         .onAppear {
             index = min(max(start, 0), max(ids.count - 1, 0))
             ep = max(startEp, 1)
             resume = startTime
             box.player.isMuted = model.muted
+            queuePlayback()
         }
-        .task(id: "\(id)-\(ep)-\(model.base)-\(ticket)-\(model.preferHevc)") { await load(id) }
-        .onChange(of: index) { _ in onNearEnd() }
+        .onChange(of: index) { newIndex in
+            commentExtra = 0
+            if !episodePaging, ids.count - newIndex <= 3 { onNearEnd() }
+            queuePlayback()
+        }
+        .onChange(of: ep) { value in
+            queuePlayback()
+            let current = ids.indices.contains(index) ? ids[index] : 0
+            guard current > 0, episodePaging || picked else { return }
+            let prev = model.history.first { $0.id == current }
+            let t = prev?.ep == value ? (prev?.t ?? 0) : 0
+            model.saveWatch(id: current, ep: value, t: t, dur: prev?.dur ?? box.dur)
+        }
+        .onChange(of: ticket) { _ in queuePlayback() }
+        .onChange(of: model.base) { _ in queuePlayback() }
+        .onChange(of: model.preferHevc) { _ in queuePlayback() }
+        .onDisappear {
+            playTask?.cancel()
+            hideChrome?.cancel()
+        }
         .onChange(of: model.muted) { on in box.player.isMuted = on }
         .onChange(of: box.failed) { msg in
             guard !msg.isEmpty, model.preferHevc, hevcAvailable else { return }
@@ -155,6 +348,11 @@ struct FeedScreen: View {
         .onChange(of: fullscreen) { on in
             model.immersive = on
             OrientationLock.apply(fullscreen: on)
+            chrome = true
+            if on { armChromeHide() } else { hideChrome?.cancel() }
+        }
+        .onChange(of: scrubLabel) { value in
+            if value != nil { hideChrome?.cancel() } else { armChromeHide() }
         }
         .onDisappear {
             if fullscreen || model.immersive {
@@ -168,7 +366,7 @@ struct FeedScreen: View {
         }
         .onReceive(Timer.publish(every: 2, on: .main, in: .common).autoconnect()) { _ in
             if id > 0, box.dur > 0, box.pos > 0.8 {
-                model.saveWatch(id: id, ep: ep, t: box.pos, dur: box.dur)
+                model.saveWatch(id: id, ep: ep, t: box.pos, dur: box.dur, keepFurther: !episodePaging && !picked)
             }
             if resume > 0.4, box.dur > resume {
                 box.player.seek(to: CMTime(seconds: resume, preferredTimescale: 600))
@@ -179,20 +377,53 @@ struct FeedScreen: View {
 
     private var topBar: some View {
         HStack {
-            if showsBack {
-                Button(action: onBack) { Image(systemName: "chevron.left").foregroundStyle(.white).padding(8) }
+            if fullscreen || showsBack {
+                Button {
+                    if fullscreen { fullscreen = false } else { onBack() }
+                } label: {
+                    Image(systemName: "chevron.left").foregroundStyle(.white).padding(8)
+                }
+                if episodePaging || fullscreen {
+                    Text("第 \(ep) 集").font(.hgTitle(18)).foregroundStyle(.white)
+                }
             } else {
                 Text("HGhub").font(.hgTitle(22)).foregroundStyle(.white).padding(.leading, 8)
             }
             Spacer()
-            if hevcAvailable {
-                Button(model.preferHevc ? "高清" : "标准") {
+            Menu {
+                let playingHevc = model.preferHevc && (hevcAvailable || !qualityKnown)
+                Button {
+                    guard model.preferHevc else { return }
                     resume = box.pos
-                    model.setPreferHevc(!model.preferHevc)
+                    model.setPreferHevc(false)
+                    armChromeHide()
+                } label: {
+                    Text(playingHevc ? "标准" : "标准  ✓")
                 }
-                .font(.subheadline).foregroundStyle(.white)
-                .padding(.horizontal, 12).padding(.vertical, 6)
-                .background(.black.opacity(0.35)).clipShape(Capsule())
+                Button {
+                    if qualityKnown, !hevcAvailable {
+                        model.show("这一集没有高清")
+                        return
+                    }
+                    guard !model.preferHevc else { return }
+                    resume = box.pos
+                    model.setPreferHevc(true)
+                    armChromeHide()
+                } label: {
+                    if qualityKnown, !hevcAvailable {
+                        Text("高清（这一集没有）")
+                    } else {
+                        Text(playingHevc ? "高清  ✓" : "高清")
+                    }
+                }
+            } label: {
+                let playingHevc = model.preferHevc && (hevcAvailable || !qualityKnown)
+                Text(playingHevc ? "高清" : "标准")
+                    .font(.subheadline)
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 12).padding(.vertical, 6)
+                    .background(.black.opacity(0.35))
+                    .clipShape(Capsule())
             }
             Button {
                 fullscreen.toggle()
@@ -201,17 +432,16 @@ struct FeedScreen: View {
                     .foregroundStyle(.white)
                     .padding(8)
             }
-            if !fullscreen {
             Button("\(speedText)x") {
                 if let i = speeds.firstIndex(of: speed) {
                     speed = speeds[(i + 1) % speeds.count]
                 } else { speed = 1 }
                 box.player.rate = speed
+                armChromeHide()
             }
             .font(.subheadline).foregroundStyle(.white)
             .padding(.horizontal, 12).padding(.vertical, 6)
             .background(.black.opacity(0.35)).clipShape(Capsule())
-            }
             Button { model.setMuted(!model.muted) } label: {
                 Image(systemName: model.muted ? "speaker.slash" : "speaker.wave.2").foregroundStyle(.white).padding(8)
             }
@@ -248,8 +478,7 @@ struct FeedScreen: View {
                 guard model.loggedIn else { return }
                 Task { try? await model.api.collect(id, on: on) }
             }
-            railButton("list.bullet", .white, "选集") { sheet = .episodes }
-            railButton("text.bubble", .white, "评论") {
+            railButton("text.bubble", .white, detail == nil && commentExtra == 0 ? "评论" : fmtCount((detail?.comment ?? 0) + commentExtra)) {
                 sheet = .comments
                 Task { comments = (try? await model.api.comments(id, ep: ep)) ?? [] }
             }
@@ -265,23 +494,94 @@ struct FeedScreen: View {
         }
     }
 
-    private var progress: some View {
-        GeometryReader { geo in
-            let frac = box.dur > 0 ? min(max(box.pos / box.dur, 0), 1) : 0
-            ZStack(alignment: .leading) {
-                Rectangle().fill(.white.opacity(0.28))
-                Rectangle().fill(hg.accent).frame(width: geo.size.width * frac)
-            }
-            .frame(height: 3)
-            .frame(maxHeight: .infinity, alignment: .bottom)
-            .contentShape(Rectangle())
-            .highPriorityGesture(DragGesture(minimumDistance: 0).onEnded { value in
-                guard box.dur > 0 else { return }
-                let x = min(max(value.location.x, 0), geo.size.width)
-                box.player.seek(to: CMTime(seconds: Double(x / geo.size.width) * box.dur, preferredTimescale: 600))
-            })
+    private var episodeSwipe: some Gesture {
+        DragGesture(minimumDistance: 36).onEnded { value in
+            let dy = value.translation.height
+            guard abs(dy) > abs(value.translation.width), abs(dy) > 64 else { return }
+            step(dy < 0 ? 1 : -1)
         }
-        .frame(height: 22)
+    }
+
+    private var progress: some View {
+        NativeScrubber(player: box.player, accent: UIColor(hg.accent)) { scrubLabel = $0 }
+            .frame(height: 52)
+            .overlay(alignment: .top) {
+                if let scrubLabel {
+                    Text(scrubLabel)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .offset(y: -16)
+                }
+            }
+    }
+
+    private func toggleChrome() {
+        chrome.toggle()
+        if chrome { armChromeHide() } else { hideChrome?.cancel() }
+    }
+
+    private func armChromeHide() {
+        hideChrome?.cancel()
+        guard fullscreen, chrome else { return }
+        hideChrome = Task {
+            try? await Task.sleep(nanoseconds: 3_500_000_000)
+            guard !Task.isCancelled else { return }
+            chrome = false
+        }
+    }
+
+    @ViewBuilder
+    private var playbackStatus: some View {
+        if box.waiting && box.failed.isEmpty {
+            ProgressView().tint(hg.accent)
+        }
+        if box.paused && box.failed.isEmpty {
+            Button { box.player.play() } label: {
+                Image(systemName: "play.fill").font(.system(size: 42)).foregroundStyle(.white)
+            }
+            .buttonStyle(.plain)
+        }
+        if !box.failed.isEmpty {
+            VStack(spacing: 12) {
+                Text(box.failed).foregroundStyle(.white).font(.subheadline).multilineTextAlignment(.center)
+                Button("重试") { ticket += 1 }
+                    .padding(.horizontal, 16).padding(.vertical, 8)
+                    .background(hg.accent).foregroundStyle(hg.onAccent).clipShape(RoundedRectangle(cornerRadius: 12))
+            }
+            .padding(.horizontal, 24)
+        }
+    }
+
+    private func episodeCount(_ id: Int) -> Int {
+        if let detail, detail.id == id, !detail.episodes.isEmpty { return detail.episodes.count }
+        if let count = Library.shared.get(id)?.episodeCount, count > 0 { return count }
+        return max(ep, 1)
+    }
+
+    private func episodeBar(_ id: Int, pickHere: Bool = false) -> some View {
+        let count = episodeCount(id)
+        let title = (episodePaging || pickHere) ? "选集 · 第 \(ep) 集 · 全 \(count) 集" : "选集 · 全 \(count) 集"
+        return Button {
+            if pickHere || episodePaging || onEnterSeries == nil {
+                sheet = .episodes
+            } else {
+                onEnterSeries?(id, ep)
+            }
+            armChromeHide()
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: "play.rectangle.on.rectangle")
+                Text(title).lineLimit(1)
+                Spacer()
+                Image(systemName: (episodePaging || fullscreen) ? "chevron.up" : "chevron.right")
+            }
+            .font(.subheadline.weight(.medium))
+            .foregroundStyle(.white)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
+            .background(Color.white.opacity(0.12))
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+        }
     }
 
     @ViewBuilder
@@ -294,6 +594,7 @@ struct FeedScreen: View {
                         ForEach(detail?.episodes ?? []) { item in
                             Button {
                                 resume = 0
+                                picked = true
                                 ep = item.ep
                                 sheet = nil
                             } label: {
@@ -330,6 +631,7 @@ struct FeedScreen: View {
                             do {
                                 try await model.api.sendComment(id, ep: ep, text: text)
                                 draft = ""
+                                commentExtra += 1
                                 model.show("已发送")
                                 comments = (try? await model.api.comments(id, ep: ep)) ?? comments
                             } catch {
@@ -347,27 +649,63 @@ struct FeedScreen: View {
     }
 
     private func step(_ delta: Int) {
-        let next = index + delta
-        guard ids.indices.contains(next) else { return }
-        index = next
-        ep = 1
-        resume = 0
-        detail = nil
+        if episodePaging {
+            let id = ids.indices.contains(index) ? ids[index] : 0
+            let total = episodeCount(id)
+            let next = ep + delta
+            let ceiling = detail?.id == id && !(detail?.episodes.isEmpty ?? true) ? total : max(total, ep + 1)
+            guard next >= 1, next <= ceiling else { return }
+            resume = 0
+            ep = next
+        } else {
+            let next = index + delta
+            guard ids.indices.contains(next) else { return }
+            index = next
+            picked = false
+            detail = nil
+            if let saved = progressFor(ids[next]) {
+                ep = max(saved.ep, 1)
+                resume = saved.time
+            } else {
+                ep = 1
+                resume = 0
+            }
+        }
     }
 
-    private func load(_ id: Int) async {
+    /// 连续快滑时只播放停下来的那一集，避免把上一个请求的失败当成当前集的错误。
+    private func queuePlayback() {
+        playTask?.cancel()
+        let id = ids.indices.contains(index) ? ids[index] : 0
+        let episode = ep
+        playTask = Task {
+            try? await Task.sleep(nanoseconds: 220_000_000)
+            guard !Task.isCancelled else { return }
+            await load(id, episode: episode)
+        }
+    }
+
+    private func load(_ id: Int, episode: Int) async {
         guard id > 0 else { return }
+        guard !Task.isCancelled else { return }
         do {
             async let d = model.api.video(id)
-            async let p = model.api.play(id, ep: ep)
+            async let p = model.api.play(id, ep: episode)
             let (detail, play) = try await (d, p)
+            guard !Task.isCancelled, self.ep == episode, (ids.indices.contains(index) ? ids[index] : 0) == id else { return }
             self.detail = detail
+            if episodePaging, !detail.episodes.isEmpty, episode > detail.episodes.count {
+                ep = detail.episodes.count
+                return
+            }
             if detail.liked && !model.isLiked(id) { model.toggleLike(id) }
             if detail.collected && !model.isFav(id) { model.toggleFav(id) }
             let hevc = play.hevcUrl
             hevcAvailable = !hevc.isEmpty
+            qualityKnown = true
             let standard = play.videoUrl.isEmpty ? detail.videoUrl : play.videoUrl
             let remote = (model.preferHevc && !hevc.isEmpty) ? hevc : standard
+            guard !Task.isCancelled else { return }
             guard !remote.isEmpty, let local = proxy.wrap(remote) else {
                 box.failed = "没有可播放的地址"
                 box.waiting = false
@@ -375,7 +713,12 @@ struct FeedScreen: View {
             }
             box.open(local, muted: model.muted)
             if speed != 1 { box.player.rate = speed }
+        } catch is CancellationError {
+            return
+        } catch let urlError as URLError where urlError.code == .cancelled {
+            return
         } catch {
+            guard !Task.isCancelled, self.ep == episode else { return }
             box.failed = error.localizedDescription
             box.waiting = false
         }
@@ -396,6 +739,7 @@ final class Library {
 }
 
 struct HomeFeed: View {
+    var openSeries: (Int, Int) -> Void = { _, _ in }
     @EnvironmentObject private var model: AppModel
     @State private var items: [VideoCard] = []
     @State private var page = 1
@@ -414,14 +758,12 @@ struct HomeFeed: View {
                 }
             } else {
                 FeedScreen(ids: items.map(\.id), start: 0, showsBack: false, onNearEnd: {
-                    if !done && !loading && indexNearEnd { Task { await load(page + 1, reset: false) } }
-                })
+                    if !done && !loading { Task { await load(page + 1, reset: false) } }
+                }, onEnterSeries: openSeries)
             }
         }
         .task { if items.isEmpty { await load(1, reset: true) } }
     }
-
-    private var indexNearEnd: Bool { true }
 
     private func load(_ next: Int, reset: Bool) async {
         if loading || (done && !reset) { return }

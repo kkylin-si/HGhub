@@ -21,6 +21,7 @@ struct Detail: Hashable {
     var tags: [String]
     var episodes: [Episode]
     var like: Int
+    var comment: Int
     var videoUrl: String
     var liked: Bool
     var collected: Bool
@@ -106,6 +107,7 @@ extension Dictionary where Key == String, Value == Any {
 
     func detail() -> Detail {
         let counts = child("counts")
+        let metrics = child("metrics")
         let interaction = child("interaction")
         let episodes = rows("episodes").map { row in
             Episode(ep: row.int("ep_num"), title: row.str("title").isEmpty ? "第\(row.int("ep_num"))集" : row.str("title"))
@@ -118,6 +120,7 @@ extension Dictionary where Key == String, Value == Any {
             tags: strings("tags"),
             episodes: episodes,
             like: counts?.int("like") ?? int("like_count"),
+            comment: counts?.int("comment") ?? metrics?.int("comment") ?? int("comment_count"),
             videoUrl: str("video_url"),
             liked: interaction?.bool("liked") ?? false,
             collected: interaction?.bool("collected") ?? false

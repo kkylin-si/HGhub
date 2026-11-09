@@ -116,9 +116,14 @@ class AppStore(ctx: Context) {
         prefs.edit().remove("searches").apply()
     }
 
-    fun saveWatch(id: Int, ep: Int, t: Double, dur: Double) {
+    fun saveWatch(id: Int, ep: Int, t: Double, dur: Double, keepFurther: Boolean = false) {
         if (id <= 0) return
-        val item = Watch(id, ep.coerceAtLeast(1), t.coerceAtLeast(0.0), dur.coerceAtLeast(0.0), System.currentTimeMillis())
+        val epN = ep.coerceAtLeast(1)
+        val prev = history.firstOrNull { it.id == id }
+        // 首页自动从第 1 集播过，不要把已经看到的更后集数冲掉。
+        if (keepFurther && prev != null && prev.ep > epN) return
+        val time = if (prev != null && prev.ep == epN && t < 1.0 && prev.t > t) prev.t else t.coerceAtLeast(0.0)
+        val item = Watch(id, epN, time, dur.coerceAtLeast(0.0), System.currentTimeMillis())
         history = listOf(item) + history.filter { it.id != id }.take(40)
         prefs.edit().putString("history", history.toJson()).apply()
     }
