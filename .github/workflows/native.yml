@@ -1,6 +1,6 @@
 name: Native mobile
 
-# 原生安卓 / iOS。推到 main 且动到 native 时自动出未签名包，也可在 Actions 页手动跑。
+# 原生安卓 / iOS。推到 main 且动到 native 时自动打包，安卓用仓库密钥签名，iOS 保持未签名，然后发到 Releases。
 on:
   push:
     branches: [main]
@@ -15,9 +15,9 @@ concurrency:
 
 jobs:
   android:
-    name: Android unsigned APK
+    name: Android signed APK
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
 
@@ -36,26 +36,50 @@ jobs:
           yes | "$SDKM" --licenses >/dev/null 2>&1 || true
           "$SDKM" --install "platforms;android-36" "build-tools;36.0.0"
 
-      - name: 编译未签名 APK
+      - name: 编译并签名 APK
         working-directory: native/android
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEY_BASE64 }}
+          HGHUB_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          HGHUB_STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          HGHUB_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           set -euo pipefail
+          if [ -z "${KEYSTORE_BASE64:-}" ] || [ -z "${HGHUB_KEY_ALIAS:-}" ]; then
+            echo "::error::缺少 Android 签名密钥（ANDROID_KEY_BASE64 / ANDROID_KEY_ALIAS）"
+            exit 1
+          fi
+          KS="$RUNNER_TEMP/release.keystore"
+          echo "$KEYSTORE_BASE64" | base64 -d > "$KS"
+          export HGHUB_KEYSTORE="$KS"
           chmod +x gradlew
-          ./gradlew :app:assembleRelease --no-daemon
+          n=0
+          until ./gradlew :app:assembleRelease --no-daemon; do
+            n=$((n + 1))
+            if [ "$n" -ge 3 ]; then
+              exit 1
+            fi
+            echo "Gradle 失败，20 秒后重试 ($n/3)"
+            sleep 20
+          done
+          rm -f "$KS"
 
-      - name: 收集产物
+      - name: 校验签名并收集产物
         run: |
           set -euo pipefail
           mkdir -p artifacts
-          f="$(find native/android/app/build/outputs/apk/release -name '*.apk' -print -quit)"
+          ver="$(sed -n 's/.*versionName = "\(.*\)".*/\1/p' native/android/app/build.gradle.kts)"
+          f="$(find native/android/app/build/outputs/apk/release -name '*.apk' ! -name '*unsigned*' -print -quit)"
           test -n "$f"
-          cp "$f" artifacts/HGhub-android-unsigned.apk
+          BT="$(ls "$ANDROID_SDK_ROOT/build-tools" | sort -V | tail -1)"
+          "$ANDROID_SDK_ROOT/build-tools/$BT/apksigner" verify --print-certs "$f"
+          cp "$f" "artifacts/HGhub_${ver}_android.apk"
           ls -lh artifacts
 
       - uses: actions/upload-artifact@v4
         with:
-          name: android-unsigned
-          path: artifacts/HGhub-android-unsigned.apk
+          name: android
+          path: artifacts/*.apk
           if-no-files-found: error
 
   ios:
@@ -87,17 +111,58 @@ jobs:
           set -euo pipefail
           APP="DerivedData/Build/Products/Release-iphoneos/HGhub.app"
           test -d "$APP"
+          ver="$(sed -n 's/.*versionName = "\(.*\)".*/\1/p' "$GITHUB_WORKSPACE/native/android/app/build.gradle.kts")"
           rm -rf build/Payload
           mkdir -p build/Payload
           ditto "$APP" build/Payload/HGhub.app
-          (cd build && zip -qry HGhub-unsigned.ipa Payload)
+          (cd build && zip -qry "HGhub_${ver}_ios-unsigned.ipa" Payload)
           codesign -dv build/Payload/HGhub.app || true
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
-          cp build/HGhub-unsigned.ipa "$GITHUB_WORKSPACE/artifacts/HGhub-ios-unsigned.ipa"
+          cp "build/HGhub_${ver}_ios-unsigned.ipa" "$GITHUB_WORKSPACE/artifacts/"
           ls -lh "$GITHUB_WORKSPACE/artifacts"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ios-unsigned
-          path: artifacts/HGhub-ios-unsigned.ipa
+          name: ios
+          path: artifacts/*.ipa
           if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: [android, ios]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 发布到 Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ver="$(sed -n 's/.*versionName = "\(.*\)".*/\1/p' native/android/app/build.gradle.kts)"
+          tag="mobile-v${ver}"
+          ls -lh dist
+          notes=$(cat <<EOF
+原生移动端 ${ver}，包名 app.hghub.mobile。
+
+- Android：已签名，可直接安装
+- iOS：未签名 IPA，需要自行签名后安装
+EOF
+)
+          gh release view "$tag" >/dev/null 2>&1 && exists=1 || exists=0
+          if [ "$exists" -eq 1 ]; then
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* \
+              --title "HGhub 移动端 ${ver}" \
+              --notes "$notes" \
+              --latest
+          fi
+          gh release view "$tag" --json url,tagName,assets --jq '{url,tag:.tagName,assets:[.assets[].name]}'

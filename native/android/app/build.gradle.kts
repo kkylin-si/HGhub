@@ -16,6 +16,18 @@ android {
         versionName = "1.2.0"
     }
 
+    val keystorePath = System.getenv("HGHUB_KEYSTORE")
+    if (!keystorePath.isNullOrBlank()) {
+        signingConfigs {
+            create("ci") {
+                storeFile = file(keystorePath)
+                storePassword = System.getenv("HGHUB_STORE_PASSWORD")
+                keyAlias = System.getenv("HGHUB_KEY_ALIAS")
+                keyPassword = System.getenv("HGHUB_KEY_PASSWORD")
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
@@ -23,6 +35,9 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro",
             )
+            if (!keystorePath.isNullOrBlank()) {
+                signingConfig = signingConfigs.getByName("ci")
+            }
         }
     }
 
