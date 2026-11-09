@@ -1,0 +1,140 @@
+package app.hghub.mobile.data
+
+import android.content.Context
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+
+class AppStore(ctx: Context) {
+    private val prefs = ctx.getSharedPreferences("hghub_native_v1", Context.MODE_PRIVATE)
+
+    var base by mutableStateOf(prefs.getString("base", DEFAULT_BASE) ?: DEFAULT_BASE)
+        private set
+    var token by mutableStateOf(prefs.getString("token", "") ?: "")
+        private set
+    var account by mutableStateOf(accountFrom(prefs.getString("user", null)))
+        private set
+    var dark by mutableStateOf(prefs.getBoolean("dark", false))
+        private set
+    var muted by mutableStateOf(prefs.getBoolean("muted", true))
+        private set
+    var muteOnStartup by mutableStateOf(prefs.getBoolean("muteOnStartup", true))
+        private set
+    var preferHevc by mutableStateOf(prefs.getBoolean("preferHevc", false))
+        private set
+    var immersive by mutableStateOf(false)
+    var favs by mutableStateOf(intsFrom(prefs.getString("favs", null)))
+        private set
+    var likes by mutableStateOf(intsFrom(prefs.getString("likes", null)))
+        private set
+    var history by mutableStateOf(watchesFrom(prefs.getString("history", null)))
+        private set
+    var searches by mutableStateOf(stringsFrom(prefs.getString("searches", null)))
+        private set
+    var toast by mutableStateOf<String?>(null)
+
+    val loggedIn: Boolean get() = token.isNotBlank()
+    val trustedLine: Boolean
+        get() = base == "https://huangguoai.com" || base == "https://huangguoai.ai"
+
+    init {
+        if (muteOnStartup && !muted) {
+            muted = true
+            prefs.edit().putBoolean("muted", true).apply()
+        }
+    }
+
+    fun show(msg: String) { toast = msg }
+
+    fun applyDark(on: Boolean) {
+        dark = on
+        prefs.edit().putBoolean("dark", on).apply()
+    }
+
+    fun applyMuted(on: Boolean) {
+        muted = on
+        prefs.edit().putBoolean("muted", on).apply()
+    }
+
+    fun applyPreferHevc(on: Boolean) {
+        preferHevc = on
+        prefs.edit().putBoolean("preferHevc", on).apply()
+    }
+
+    fun applyMuteOnStartup(on: Boolean) {
+        muteOnStartup = on
+        prefs.edit().putBoolean("muteOnStartup", on).apply()
+    }
+
+    fun setLine(url: String) {
+        val next = url.trim().trimEnd('/')
+        if (next == base) return
+        base = next
+        token = ""
+        account = null
+        prefs.edit().putString("base", next).remove("token").remove("user").apply()
+    }
+
+    fun setSession(token: String, user: Account) {
+        this.token = token
+        account = user
+        prefs.edit().putString("token", token).putString("user", user.toJson().toString()).apply()
+    }
+
+    fun logout() {
+        token = ""
+        account = null
+        prefs.edit().remove("token").remove("user").apply()
+    }
+
+    fun isFav(id: Int) = id in favs
+    fun isLiked(id: Int) = id in likes
+
+    fun toggleFav(id: Int): Boolean {
+        val on = id !in favs
+        favs = if (on) listOf(id) + favs else favs.filter { it != id }
+        prefs.edit().putString("favs", favs.intsJson()).apply()
+        return on
+    }
+
+    fun toggleLike(id: Int): Boolean {
+        val on = id !in likes
+        likes = if (on) listOf(id) + likes else likes.filter { it != id }
+        prefs.edit().putString("likes", likes.intsJson()).apply()
+        return on
+    }
+
+    fun rememberSearch(q: String) {
+        val k = q.trim()
+        if (k.isEmpty()) return
+        searches = (listOf(k) + searches.filter { it != k }).take(12)
+        prefs.edit().putString("searches", searches.stringsJson()).apply()
+    }
+
+    fun clearSearch() {
+        searches = emptyList()
+        prefs.edit().remove("searches").apply()
+    }
+
+    fun saveWatch(id: Int, ep: Int, t: Double, dur: Double) {
+        if (id <= 0) return
+        val item = Watch(id, ep.coerceAtLeast(1), t.coerceAtLeast(0.0), dur.coerceAtLeast(0.0), System.currentTimeMillis())
+        history = listOf(item) + history.filter { it.id != id }.take(40)
+        prefs.edit().putString("history", history.toJson()).apply()
+    }
+
+    fun clearLocal() {
+        favs = emptyList()
+        likes = emptyList()
+        history = emptyList()
+        prefs.edit().remove("favs").remove("likes").remove("history").apply()
+    }
+
+    companion object {
+        const val DEFAULT_BASE = "https://huangguoai.com"
+        val FIXED = listOf(
+            "固定线路 1" to "https://huangguoai.com",
+            "固定线路 2" to "https://huangguoai.ai",
+        )
+    }
+}
