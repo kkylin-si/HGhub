@@ -109,7 +109,7 @@ struct LibraryScreen: View {
     var kind: String
     var back: () -> Void
     var open: (Int, Int, Double) -> Void
-    var series: (Int, Int) -> Void
+    var series: (Int, Int, Double) -> Void
     @EnvironmentObject private var model: AppModel
     @Environment(\.hg) private var hg
     @State private var cards: [Detail] = []

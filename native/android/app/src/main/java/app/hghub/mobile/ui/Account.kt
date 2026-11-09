@@ -142,7 +142,7 @@ fun LibraryScreen(
     kind: String,
     onBack: () -> Unit,
     onOpen: (Int, Int, Double) -> Unit,
-    onSeries: (Int, Int) -> Unit,
+    onSeries: (Int, Int, Double) -> Unit,
 ) {
     val app = LocalApp.current
     val c = LocalHg.current

@@ -68,6 +68,7 @@ import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
@@ -129,7 +130,7 @@ fun VideoFeed(
     onBack: (() -> Unit)?,
     onNearEnd: (() -> Unit)?,
     episodePaging: Boolean = false,
-    onEnterSeries: ((Int, Int) -> Unit)? = null,
+    onEnterSeries: ((Int, Int, Double) -> Unit)? = null,
     progressOf: (Int) -> Pair<Int, Double>? = { null },
 ) {
     val app = LocalApp.current
@@ -147,12 +148,12 @@ fun VideoFeed(
         initialPage = if (episodePaging) (startEp - 1).coerceAtLeast(0) else start.coerceIn(0, ids.lastIndex),
         pageCount = { if (episodePaging) episodeTotal.coerceAtLeast(1) else ids.size.coerceAtLeast(1) },
     )
-    val player = remember(base) {
-        val headers = mapOf("Referer" to base.trimEnd('/') + "/", "Origin" to base.trimEnd('/'))
-        val dataSource = DefaultHttpDataSource.Factory()
+    val dataSource = remember {
+        DefaultHttpDataSource.Factory()
             .setUserAgent(HgApiUa)
-            .setDefaultRequestProperties(headers)
             .setAllowCrossProtocolRedirects(true)
+    }
+    val player = remember {
         ExoPlayer.Builder(context)
             .setMediaSourceFactory(DefaultMediaSourceFactory(dataSource))
             .build()
@@ -166,6 +167,9 @@ fun VideoFeed(
     var pos by remember { mutableLongStateOf(0L) }
     var dur by remember { mutableLongStateOf(0L) }
     var buffering by remember { mutableStateOf(true) }
+    var switching by remember { mutableStateOf(true) }
+    var lineAttempt by remember { mutableIntStateOf(0) }
+    var lineFor by remember { mutableStateOf("") }
     var failed by remember { mutableStateOf("") }
     var paused by remember { mutableStateOf(false) }
     var speedIndex by remember { mutableIntStateOf(0) }
@@ -185,7 +189,7 @@ fun VideoFeed(
     var commentExtra by remember(if (episodePaging) ids.firstOrNull() else ids.getOrNull(pager.currentPage)) { mutableIntStateOf(0) }
     val comments = remember { androidx.compose.runtime.mutableStateListOf<Comment>() }
     var commentText by remember { mutableStateOf("") }
-    var resume by remember { mutableStateOf(if (startTimeSec > 1) startTimeSec else 0.0) }
+    var resume by remember { mutableStateOf(if (startTimeSec > 0.3) startTimeSec else 0.0) }
     var ticket by remember { mutableIntStateOf(0) }
     var fullscreen by remember { mutableStateOf(false) }
     var chrome by remember { mutableStateOf(true) }
@@ -193,6 +197,8 @@ fun VideoFeed(
     var hevcUrl by remember { mutableStateOf("") }
     var qualityKnown by remember { mutableStateOf(false) }
     var playGen by remember { mutableIntStateOf(0) }
+
+    val onEpisodeEnded = remember { EndBridge() }
 
     DisposableEffect(player) {
         val listener = object : Player.Listener {
@@ -202,18 +208,27 @@ fun VideoFeed(
                     player.seekTo((resume * 1000).toLong())
                     resume = 0.0
                 }
+                if (state == Player.STATE_ENDED) onEpisodeEnded.go()
             }
             override fun onPlayerError(error: PlaybackException) {
-                val seen = playGen
-                if (seen != playGen) return
                 if (app.store.preferHevc && hevcUrl.isNotBlank()) {
                     val stay = player.currentPosition
                     if (stay > 300) resume = stay / 1000.0
                     app.store.applyPreferHevc(false)
                     app.store.show("高清暂时播不了，已切回标准")
                     failed = ""
+                    return
+                }
+                val stay = player.currentPosition
+                if (stay > 300) resume = stay / 1000.0
+                val all = playbackOrigins(app.store.base)
+                if (lineAttempt < all.lastIndex) {
+                    lineAttempt += 1
+                    failed = ""
+                    app.store.show("当前线路拥挤，正在换线路")
                 } else {
                     failed = "这一集暂时播不了，可换线路或重试"
+                    switching = false
                     buffering = false
                 }
             }
@@ -254,6 +269,30 @@ fun VideoFeed(
 
     val currentId = if (episodePaging) ids.first() else ids[pager.currentPage.coerceIn(0, ids.lastIndex)]
     val playingEp = if (episodePaging) pager.currentPage + 1 else ep
+    SideEffect {
+        onEpisodeEnded.go = go@{
+            val now = SystemClock.uptimeMillis()
+            if (now - onEpisodeEnded.at < 700) return@go
+            onEpisodeEnded.at = now
+            val total = if (episodePaging) {
+                episodeTotal.coerceAtLeast(1)
+            } else {
+                (detail?.episodes?.size?.takeIf { it > 0 } ?: detail?.episodeCount ?: Library.get(currentId)?.episodeCount ?: playingEp).coerceAtLeast(1)
+            }
+            if (playingEp < total) {
+                resume = 0.0
+                if (episodePaging) {
+                    scope.launch { pager.scrollToPage(playingEp.coerceIn(0, (episodeTotal - 1).coerceAtLeast(0))) }
+                } else {
+                    picked = true
+                    ep = playingEp + 1
+                }
+            } else {
+                player.seekTo(0)
+                player.play()
+            }
+        }
+    }
 
     LaunchedEffect(episodePaging, startEp) {
         if (!episodePaging) return@LaunchedEffect
@@ -273,7 +312,7 @@ fun VideoFeed(
     LaunchedEffect(pager.currentPage, episodePaging) {
         if (episodePaging) return@LaunchedEffect
         if (pager.currentPage == start) {
-            resume = if (startTimeSec > 1) startTimeSec else 0.0
+            resume = if (startTimeSec > 0.3) startTimeSec else 0.0
             return@LaunchedEffect
         }
         val saved = ids.getOrNull(pager.currentPage)?.let(progressOf)
@@ -312,9 +351,19 @@ fun VideoFeed(
         }
     }
 
-    LaunchedEffect(currentId, playingEp, base, ticket, app.store.preferHevc) {
+    LaunchedEffect(currentId, playingEp, base, ticket, app.store.preferHevc, lineAttempt) {
         val id = currentId
         val episode = playingEp
+        val marker = "$id:$episode"
+        if (lineFor != marker) {
+            lineFor = marker
+            if (lineAttempt != 0) {
+                lineAttempt = 0
+                return@LaunchedEffect
+            }
+        }
+        switching = true
+        failed = ""
         delay(180)
         snapshotFlow { pager.isScrollInProgress }.first { !it }
         if (episodePaging) {
@@ -322,49 +371,85 @@ fun VideoFeed(
         } else if (ids.getOrNull(pager.currentPage) != id) {
             return@LaunchedEffect
         }
-        failed = ""
         buffering = true
-        val pair = try {
-            val d = app.api.video(id)
-            val play = app.api.play(id, episode)
-            d to play
+        val loadedDetail = try {
+            app.api.video(id)
         } catch (e: CancellationException) {
             throw e
-        } catch (e: Exception) {
-            if (stillCurrent(episodePaging, pager.currentPage, ids, id, episode)) {
-                failed = e.message ?: "加载失败"
-                buffering = false
-            }
-            return@LaunchedEffect
+        } catch (_: Exception) {
+            null
         }
         if (!stillCurrent(episodePaging, pager.currentPage, ids, id, episode)) return@LaunchedEffect
-        detail = pair.first
-        if (episodePaging) {
-            val total = pair.first.episodes.size.takeIf { it > 0 } ?: pair.first.episodeCount
+        if (loadedDetail != null) detail = loadedDetail
+        if (episodePaging && loadedDetail != null) {
+            val total = loadedDetail.episodes.size.takeIf { it > 0 } ?: loadedDetail.episodeCount
             if (total > 0 && total != episodeTotal) episodeTotal = total
             if (total > 0 && episode > total) {
                 pager.scrollToPage(total - 1)
                 return@LaunchedEffect
             }
         }
-        if (pair.first.liked && !app.store.isLiked(id)) app.store.toggleLike(id)
-        if (pair.first.collected && !app.store.isFav(id)) app.store.toggleFav(id)
-        hevcUrl = pair.second.hevcUrl
-        qualityKnown = true
-        val standard = pair.second.videoUrl.ifBlank { pair.first.videoUrl }
-        val url = if (app.store.preferHevc && pair.second.hevcUrl.isNotBlank()) pair.second.hevcUrl else standard
+        if (loadedDetail?.liked == true && !app.store.isLiked(id)) app.store.toggleLike(id)
+        if (loadedDetail?.collected == true && !app.store.isFav(id)) app.store.toggleFav(id)
+        val lines = playbackOrigins(base).drop(lineAttempt.coerceAtLeast(0))
+        var playInfo: app.hghub.mobile.data.PlayInfo? = null
+        var originUsed = ""
+        var lastError = "没有可播放的地址"
+        for (origin in lines) {
+            if (!stillCurrent(episodePaging, pager.currentPage, ids, id, episode)) return@LaunchedEffect
+            try {
+                val info = app.api.play(id, episode, origin)
+                val candidate = if (app.store.preferHevc && info.hevcUrl.isNotBlank()) info.hevcUrl else info.videoUrl
+                if (candidate.isNotBlank() || info.videoUrl.isNotBlank()) {
+                    playInfo = info
+                    originUsed = origin
+                    break
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                lastError = e.message ?: lastError
+            }
+        }
+        val play = playInfo
         if (!stillCurrent(episodePaging, pager.currentPage, ids, id, episode)) return@LaunchedEffect
-        if (url.isBlank()) {
-            failed = "没有可播放的地址"
+        if (play == null || originUsed.isBlank()) {
+            failed = lastError
+            switching = false
             buffering = false
             return@LaunchedEffect
         }
+        hevcUrl = play.hevcUrl
+        qualityKnown = true
+        val standard = play.videoUrl.ifBlank { loadedDetail?.videoUrl.orEmpty() }
+        val url = if (app.store.preferHevc && play.hevcUrl.isNotBlank()) play.hevcUrl else standard
+        if (url.isBlank()) {
+            failed = "没有可播放的地址"
+            switching = false
+            buffering = false
+            return@LaunchedEffect
+        }
+        val origin = originUsed.trimEnd('/')
+        dataSource.setDefaultRequestProperties(mapOf("Referer" to "$origin/", "Origin" to origin))
         playGen += 1
         player.setMediaItem(MediaItem.fromUri(url))
         player.prepare()
         player.playWhenReady = true
         player.setPlaybackSpeed(speeds[speedIndex])
         player.volume = if (app.store.muted) 0f else 1f
+        switching = false
+    }
+
+    LaunchedEffect(playGen) {
+        if (playGen == 0) return@LaunchedEffect
+        delay(9000)
+        if (player.playbackState != Player.STATE_BUFFERING || player.currentPosition > 800) return@LaunchedEffect
+        val all = playbackOrigins(base)
+        if (lineAttempt >= all.lastIndex) return@LaunchedEffect
+        val stay = player.currentPosition
+        if (stay > 300) resume = stay / 1000.0
+        lineAttempt += 1
+        app.store.show("当前线路拥挤，正在换线路")
     }
 
     @Composable
@@ -461,7 +546,7 @@ fun VideoFeed(
                 .background(Color(0x22FFFFFF))
                 .clickable {
                     if (pickHere || episodePaging || onEnterSeries == null) sheet = SheetKind.Episodes
-                    else onEnterSeries.invoke(currentId, playingEp)
+                    else onEnterSeries.invoke(currentId, playingEp, player.currentPosition.coerceAtLeast(0L) / 1000.0)
                     chromeTick += 1
                 }
                 .padding(horizontal = 14.dp, vertical = 12.dp),
@@ -488,8 +573,12 @@ fun VideoFeed(
                 modifier = Modifier.size(72.dp).clickable { player.play() },
             )
         }
-        if (buffering && failed.isBlank()) {
-            CircularProgressIndicator(color = Color(0xFFE08A6E), strokeWidth = 2.dp)
+        if ((switching || buffering) && failed.isBlank()) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                CircularProgressIndicator(color = Color(0xFFE08A6E), strokeWidth = 2.dp)
+                Spacer(Modifier.height(8.dp))
+                Text("加载中", color = Color.White, fontSize = 13.sp)
+            }
         }
         if (failed.isNotBlank()) {
             Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.padding(24.dp)) {
@@ -499,7 +588,7 @@ fun VideoFeed(
                     "重试",
                     color = Color(0xFF2A120C),
                     modifier = Modifier.clip(RoundedCornerShape(12.dp)).background(Color(0xFFE08A6E)).clickable {
-                        ticket += 1
+                        if (lineAttempt != 0) lineAttempt = 0 else ticket += 1
                     }.padding(horizontal = 16.dp, vertical = 8.dp),
                 )
             }
@@ -716,6 +805,19 @@ private fun Context.findActivity(): Activity? {
 private const val HgApiUa =
     "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36"
 
+private class EndBridge {
+    var go: () -> Unit = {}
+    var at: Long = 0L
+}
+
+private fun playbackOrigins(current: String): List<String> {
+    val fixed = listOf("https://huangguoai.com", "https://huangguoai.ai")
+    return (listOf(current.trim().trimEnd('/')) + fixed)
+        .map { it.trimEnd('/') }
+        .filter { it.startsWith("https://") }
+        .distinct()
+}
+
 private fun stillCurrent(episodePaging: Boolean, page: Int, ids: List<Int>, id: Int, episode: Int): Boolean {
     return if (episodePaging) page + 1 == episode else ids.getOrNull(page) == id
 }
@@ -723,8 +825,12 @@ private fun stillCurrent(episodePaging: Boolean, page: Int, ids: List<Int>, id: 
 @Composable
 private fun ProgressScrubber(player: Player, onActive: (Boolean) -> Unit = {}) {
     var label by remember { mutableStateOf<String?>(null) }
+    var dragMs by remember { mutableStateOf<Long?>(null) }
+    var clock by remember { mutableStateOf(0L to 0L) }
+    val shownPos = dragMs ?: clock.first
+    val shownDur = clock.second
     Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp)) {
-        Box(Modifier.fillMaxWidth().height(22.dp), contentAlignment = Alignment.Center) {
+        Box(Modifier.fillMaxWidth().height(18.dp), contentAlignment = Alignment.Center) {
             if (label != null) {
                 Text(label!!, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
             }
@@ -739,6 +845,7 @@ private fun ProgressScrubber(player: Player, onActive: (Boolean) -> Unit = {}) {
                             val duration = bar.player?.duration ?: 0L
                             if (duration <= 0) return
                             val target = duration * progress / seekBar.max
+                            dragMs = target
                             label = fmtClock(target / 1000.0)
                             onActive(true)
                             val now = SystemClock.uptimeMillis()
@@ -759,14 +866,25 @@ private fun ProgressScrubber(player: Player, onActive: (Boolean) -> Unit = {}) {
                             bar.tracking = false
                             val duration = bar.player?.duration ?: 0L
                             if (duration > 0) bar.player?.seekTo(duration * seekBar.progress / seekBar.max)
+                            dragMs = null
                             label = null
                             onActive(false)
                         }
                     })
                 }
             },
-            modifier = Modifier.fillMaxWidth().height(40.dp),
-            update = { it.player = player },
+            modifier = Modifier.fillMaxWidth().height(36.dp),
+            update = {
+                it.player = player
+                it.onClock = { position, duration -> clock = position to duration }
+            },
+        )
+        Text(
+            "${fmtClock(shownPos / 1000.0)} / ${fmtClock(shownDur / 1000.0)}",
+            color = Color.White.copy(alpha = 0.9f),
+            fontSize = 12.sp,
+            modifier = Modifier.fillMaxWidth().padding(top = 2.dp),
+            textAlign = TextAlign.Center,
         )
     }
 }
@@ -776,14 +894,21 @@ private class ThickSeekBar(context: android.content.Context) : SeekBar(context) 
     var player: Player? = null
     var tracking = false
     var lastSeekMs = 0L
+    var onClock: ((Long, Long) -> Unit)? = null
+    private var lastClockMs = 0L
 
     private val frame = object : Choreographer.FrameCallback {
         override fun doFrame(frameTimeNanos: Long) {
             val current = player
-            if (!tracking && current != null) {
+            if (current != null) {
                 val duration = current.duration
-                val position = current.currentPosition
-                if (duration > 0 && position >= 0) {
+                val position = current.currentPosition.coerceAtLeast(0L)
+                val now = SystemClock.uptimeMillis()
+                if (now - lastClockMs >= 200) {
+                    lastClockMs = now
+                    onClock?.invoke(position, if (duration > 0) duration else 0L)
+                }
+                if (!tracking && duration > 0) {
                     val next = ((position.toDouble() / duration) * max).toInt().coerceIn(0, max)
                     if (progress != next) progress = next
                 }
@@ -974,7 +1099,7 @@ private fun CommentSheet(
 }
 
 @Composable
-fun HomeFeed(onOpenSearch: () -> Unit, onEnterSeries: (Int, Int) -> Unit = { _, _ -> }) {
+fun HomeFeed(onOpenSearch: () -> Unit, onEnterSeries: (Int, Int, Double) -> Unit = { _, _, _ -> }) {
     val app = LocalApp.current
     val scope = rememberCoroutineScope()
     var items by remember { mutableStateOf(HomeCache.items) }

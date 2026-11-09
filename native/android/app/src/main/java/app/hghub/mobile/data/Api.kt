@@ -52,8 +52,8 @@ class HgApi(private val store: AppStore) {
 
     suspend fun video(id: Int): Detail = get("/api/videos/$id").toDetail()
 
-    suspend fun play(id: Int, ep: Int): PlayInfo =
-        get("/api/videos/$id/play?ep=$ep&page_texts=0").toPlay()
+    suspend fun play(id: Int, ep: Int, origin: String? = null): PlayInfo =
+        get("/api/videos/$id/play?ep=$ep&page_texts=0", origin).toPlay()
 
     suspend fun comments(id: Int, ep: Int, page: Int): Pair<List<Comment>, PageInfo> =
         get("/api/videos/$id/comments?ep=$ep&page=$page&size=20").let { it.items().map { o -> o.toComment() } to it.toPage() }
@@ -156,11 +156,11 @@ class HgApi(private val store: AppStore) {
         if (!store.trustedLine) throw ApiException("镜像线路仅供游客浏览，登录请切换到固定线路")
     }
 
-    private suspend fun get(path: String): JSONObject =
-        withContext(Dispatchers.IO) { call("GET", path, null, false) }
+    private suspend fun get(path: String, origin: String? = null): JSONObject =
+        withContext(Dispatchers.IO) { call("GET", path, null, false, origin) }
 
-    private fun call(method: String, path: String, body: JSONObject?, auth: Boolean): JSONObject {
-        val origin = store.base.trimEnd('/')
+    private fun call(method: String, path: String, body: JSONObject?, auth: Boolean, originOverride: String? = null): JSONObject {
+        val origin = (originOverride ?: store.base).trim().trimEnd('/')
         guard(origin)
         if (auth && store.token.isBlank()) throw ApiException("请先登录")
         val encoded = if (body == null) "" else Base64.encodeToString(body.toString().toByteArray(), Base64.NO_WRAP)

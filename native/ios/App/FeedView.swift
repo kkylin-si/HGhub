@@ -207,7 +207,7 @@ struct FeedScreen: View {
     var episodePaging = false
     var onBack: () -> Void = {}
     var onNearEnd: () -> Void = {}
-    var onEnterSeries: ((Int, Int) -> Void)? = nil
+    var onEnterSeries: ((Int, Int, Double) -> Void)? = nil
     /// 历史滑动时，每部剧回到自己记下的集数和进度。
     var progressFor: (Int) -> (ep: Int, time: Double)? = { _ in nil }
 
@@ -233,6 +233,11 @@ struct FeedScreen: View {
     @State private var playTask: Task<Void, Never>?
     @State private var picked = false
     @State private var commentExtra = 0
+    @State private var lastEnded = 0.0
+    @State private var switching = false
+    @State private var lineAttempt = 0
+    @State private var lineFor = ""
+    @State private var waitSince: Date?
 
     private let speeds: [Float] = [1, 1.25, 1.5, 2]
 
@@ -338,12 +343,21 @@ struct FeedScreen: View {
         }
         .onChange(of: model.muted) { on in box.player.isMuted = on }
         .onChange(of: box.failed) { msg in
-            guard !msg.isEmpty, model.preferHevc, hevcAvailable else { return }
-            resume = max(box.pos, resume)
+            guard !msg.isEmpty else { return }
+            if model.preferHevc, hevcAvailable {
+                resume = max(box.pos, resume)
+                box.failed = ""
+                box.player.replaceCurrentItem(with: nil)
+                model.setPreferHevc(false)
+                model.show("高清暂时播不了，已切回标准")
+                return
+            }
+            let all = playbackOrigins(model.base)
+            guard lineAttempt < all.count - 1 else { return }
+            lineAttempt += 1
             box.failed = ""
-            box.player.replaceCurrentItem(with: nil)
-            model.setPreferHevc(false)
-            model.show("高清暂时播不了，已切回标准")
+            model.show("当前线路拥挤，正在换线路")
+            queuePlayback()
         }
         .onChange(of: fullscreen) { on in
             model.immersive = on
@@ -368,9 +382,40 @@ struct FeedScreen: View {
             if id > 0, box.dur > 0, box.pos > 0.8 {
                 model.saveWatch(id: id, ep: ep, t: box.pos, dur: box.dur, keepFurther: !episodePaging && !picked)
             }
+            if box.pos > 0.5 { waitSince = nil }
+            if box.failed.isEmpty, (switching || box.waiting), box.pos < 0.5, let waitSince, Date().timeIntervalSince(waitSince) > 9 {
+                self.waitSince = nil
+                let all = playbackOrigins(model.base)
+                if lineAttempt < all.count - 1 {
+                    lineAttempt += 1
+                    model.show("当前线路拥挤，正在换线路")
+                    queuePlayback()
+                }
+            }
             if resume > 0.4, box.dur > resume {
                 box.player.seek(to: CMTime(seconds: resume, preferredTimescale: 600))
                 resume = 0
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .AVPlayerItemDidPlayToEndTime)) { note in
+            guard let item = note.object as? AVPlayerItem, item == box.player.currentItem else { return }
+            let now = Date().timeIntervalSince1970
+            guard now - lastEnded > 0.7 else { return }
+            lastEnded = now
+            let current = ids.indices.contains(index) ? ids[index] : 0
+            let total = episodeCount(current)
+            if ep < total {
+                resume = 0
+                if episodePaging {
+                    step(1)
+                } else {
+                    picked = true
+                    ep += 1
+                }
+            } else {
+                resume = 0
+                box.player.seek(to: .zero)
+                box.player.play()
             }
         }
     }
@@ -503,16 +548,23 @@ struct FeedScreen: View {
     }
 
     private var progress: some View {
-        NativeScrubber(player: box.player, accent: UIColor(hg.accent)) { scrubLabel = $0 }
-            .frame(height: 52)
-            .overlay(alignment: .top) {
-                if let scrubLabel {
-                    Text(scrubLabel)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.white)
-                        .offset(y: -16)
+        VStack(spacing: 2) {
+            NativeScrubber(player: box.player, accent: UIColor(hg.accent)) { scrubLabel = $0 }
+                .frame(height: 36)
+                .overlay(alignment: .top) {
+                    if let scrubLabel {
+                        Text(scrubLabel)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.white)
+                            .offset(y: -16)
+                    }
                 }
-            }
+            Text("\(scrubLabel ?? fmtClock(box.pos)) / \(fmtClock(box.dur))")
+                .font(.caption2)
+                .foregroundStyle(.white.opacity(0.9))
+                .frame(maxWidth: .infinity)
+        }
+        .frame(height: 58)
     }
 
     private func toggleChrome() {
@@ -532,8 +584,11 @@ struct FeedScreen: View {
 
     @ViewBuilder
     private var playbackStatus: some View {
-        if box.waiting && box.failed.isEmpty {
-            ProgressView().tint(hg.accent)
+        if (switching || box.waiting) && box.failed.isEmpty {
+            VStack(spacing: 8) {
+                ProgressView().tint(hg.accent)
+                Text("加载中").font(.caption).foregroundStyle(.white)
+            }
         }
         if box.paused && box.failed.isEmpty {
             Button { box.player.play() } label: {
@@ -544,7 +599,11 @@ struct FeedScreen: View {
         if !box.failed.isEmpty {
             VStack(spacing: 12) {
                 Text(box.failed).foregroundStyle(.white).font(.subheadline).multilineTextAlignment(.center)
-                Button("重试") { ticket += 1 }
+                Button("重试") {
+                    lineAttempt = 0
+                    lineFor = ""
+                    ticket += 1
+                }
                     .padding(.horizontal, 16).padding(.vertical, 8)
                     .background(hg.accent).foregroundStyle(hg.onAccent).clipShape(RoundedRectangle(cornerRadius: 12))
             }
@@ -565,7 +624,7 @@ struct FeedScreen: View {
             if pickHere || episodePaging || onEnterSeries == nil {
                 sheet = .episodes
             } else {
-                onEnterSeries?(id, ep)
+                onEnterSeries?(id, ep, box.pos)
             }
             armChromeHide()
         } label: {
@@ -678,6 +737,14 @@ struct FeedScreen: View {
         playTask?.cancel()
         let id = ids.indices.contains(index) ? ids[index] : 0
         let episode = ep
+        let marker = "\(id):\(episode)"
+        if lineFor != marker {
+            lineFor = marker
+            lineAttempt = 0
+        }
+        switching = true
+        box.failed = ""
+        waitSince = Date()
         playTask = Task {
             try? await Task.sleep(nanoseconds: 220_000_000)
             guard !Task.isCancelled else { return }
@@ -688,40 +755,77 @@ struct FeedScreen: View {
     private func load(_ id: Int, episode: Int) async {
         guard id > 0 else { return }
         guard !Task.isCancelled else { return }
+        switching = true
         do {
-            async let d = model.api.video(id)
-            async let p = model.api.play(id, ep: episode)
-            let (detail, play) = try await (d, p)
+            let loaded = try? await model.api.video(id)
             guard !Task.isCancelled, self.ep == episode, (ids.indices.contains(index) ? ids[index] : 0) == id else { return }
-            self.detail = detail
-            if episodePaging, !detail.episodes.isEmpty, episode > detail.episodes.count {
-                ep = detail.episodes.count
+            if let loaded { detail = loaded }
+            if episodePaging, let loaded, !loaded.episodes.isEmpty, episode > loaded.episodes.count {
+                ep = loaded.episodes.count
                 return
             }
-            if detail.liked && !model.isLiked(id) { model.toggleLike(id) }
-            if detail.collected && !model.isFav(id) { model.toggleFav(id) }
-            let hevc = play.hevcUrl
-            hevcAvailable = !hevc.isEmpty
+            if let loaded {
+                if loaded.liked && !model.isLiked(id) { model.toggleLike(id) }
+                if loaded.collected && !model.isFav(id) { model.toggleFav(id) }
+            }
+            let lines = Array(playbackOrigins(model.base).dropFirst(lineAttempt))
+            var play: PlayInfo?
+            var used = ""
+            var last = "没有可播放的地址"
+            for origin in lines {
+                if Task.isCancelled || self.ep != episode { return }
+                do {
+                    let info = try await model.api.play(id, ep: episode, origin: origin)
+                    let candidate = (model.preferHevc && !info.hevcUrl.isEmpty) ? info.hevcUrl : info.videoUrl
+                    if !candidate.isEmpty || !info.videoUrl.isEmpty {
+                        play = info
+                        used = origin
+                        break
+                    }
+                } catch is CancellationError {
+                    return
+                } catch {
+                    last = error.localizedDescription
+                }
+            }
+            guard !Task.isCancelled, self.ep == episode else { return }
+            guard let play, !used.isEmpty else {
+                box.failed = last
+                box.waiting = false
+                switching = false
+                return
+            }
+            hevcAvailable = !play.hevcUrl.isEmpty
             qualityKnown = true
-            let standard = play.videoUrl.isEmpty ? detail.videoUrl : play.videoUrl
-            let remote = (model.preferHevc && !hevc.isEmpty) ? hevc : standard
-            guard !Task.isCancelled else { return }
-            guard !remote.isEmpty, let local = proxy.wrap(remote) else {
+            let standard = play.videoUrl.isEmpty ? (detail?.videoUrl ?? "") : play.videoUrl
+            let remote = (model.preferHevc && !play.hevcUrl.isEmpty) ? play.hevcUrl : standard
+            guard !remote.isEmpty else {
                 box.failed = "没有可播放的地址"
                 box.waiting = false
+                switching = false
+                return
+            }
+            proxy.updateReferer(used + "/")
+            guard let local = proxy.wrap(remote) else {
+                box.failed = "没有可播放的地址"
+                box.waiting = false
+                switching = false
                 return
             }
             box.open(local, muted: model.muted)
             if speed != 1 { box.player.rate = speed }
-        } catch is CancellationError {
-            return
-        } catch let urlError as URLError where urlError.code == .cancelled {
-            return
-        } catch {
-            guard !Task.isCancelled, self.ep == episode else { return }
-            box.failed = error.localizedDescription
-            box.waiting = false
+            switching = false
         }
+    }
+
+    private func playbackOrigins(_ current: String) -> [String] {
+        let fixed = ["https://huangguoai.com", "https://huangguoai.ai"]
+        var all: [String] = []
+        for raw in [current] + fixed {
+            let url = raw.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            if url.hasPrefix("https://") && !all.contains(url) { all.append(url) }
+        }
+        return all
     }
 }
 
@@ -739,7 +843,7 @@ final class Library {
 }
 
 struct HomeFeed: View {
-    var openSeries: (Int, Int) -> Void = { _, _ in }
+    var openSeries: (Int, Int, Double) -> Void = { _, _, _ in }
     @EnvironmentObject private var model: AppModel
     @State private var items: [VideoCard] = []
     @State private var page = 1

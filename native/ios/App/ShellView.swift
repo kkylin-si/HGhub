@@ -24,7 +24,7 @@ struct ShellView: View {
                     route(top)
                 } else {
                     switch tab {
-                    case 0: HomeFeed(openSeries: { id, ep in enterSeries(id, ep, 0) })
+                    case 0: HomeFeed(openSeries: { id, ep, time in enterSeries(id, ep, time) })
                     case 1: SearchScreen(open: pushFeed, ranks: { stack.append(.ranks) })
                     case 2: CategoryScreen(
                         channel: { stack.append(.channel($0, $1)) },
@@ -71,8 +71,8 @@ struct ShellView: View {
     private func route(_ top: Route) -> some View {
         switch top {
         case let .feed(ids, index, ep, time):
-            FeedScreen(ids: ids, start: index, startEp: ep, startTime: time, onBack: pop, onEnterSeries: { id, ep in
-                enterSeries(id, ep, 0)
+            FeedScreen(ids: ids, start: index, startEp: ep, startTime: time, onBack: pop, onEnterSeries: { id, ep, time in
+                enterSeries(id, ep, time)
             })
         case let .series(id, ep, time):
             FeedScreen(ids: [id], start: 0, startEp: ep, startTime: time, episodePaging: true, onBack: pop)
@@ -90,7 +90,7 @@ struct ShellView: View {
                 kind: kind,
                 back: pop,
                 open: { id, ep, time in enterSeries(id, ep, time) },
-                series: { id, ep in enterSeries(id, ep, 0) }
+                series: { id, ep, time in enterSeries(id, ep, time) }
             )
         case .settings:
             SettingsScreen(back: pop)

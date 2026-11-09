@@ -40,7 +40,9 @@ final class HgApi {
 
     func post(_ id: Int) async throws -> PostItem { try await get("/api/posts/\(id)").post() }
     func video(_ id: Int) async throws -> Detail { try await get("/api/videos/\(id)").detail() }
-    func play(_ id: Int, ep: Int) async throws -> PlayInfo { try await get("/api/videos/\(id)/play?ep=\(ep)&page_texts=0").play() }
+    func play(_ id: Int, ep: Int, origin: String? = nil) async throws -> PlayInfo {
+        try await call("GET", "/api/videos/\(id)/play?ep=\(ep)&page_texts=0", nil, auth: false, origin: origin).play()
+    }
     func comments(_ id: Int, ep: Int) async throws -> [CommentItem] {
         try await get("/api/videos/\(id)/comments?ep=\(ep)&page=1&size=20").rows("items").map { $0.comment() }
     }
@@ -117,8 +119,9 @@ final class HgApi {
         try await call("GET", path, nil, auth: false)
     }
 
-    private func call(_ method: String, _ path: String, _ body: [String: Any]?, auth: Bool) async throws -> [String: Any] {
-        let origin = await model.base
+    private func call(_ method: String, _ path: String, _ body: [String: Any]?, auth: Bool, origin override: String? = nil) async throws -> [String: Any] {
+        let current = await model.base
+        let origin = (override ?? current).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         let token = await model.token
         guard allow(origin) else { throw ApiError.message("线路地址无效") }
         if auth && token.isEmpty { throw ApiError.message("请先登录") }

@@ -75,7 +75,7 @@ fun Shell() {
                     top.ids, top.index, top.ep, top.time,
                     onBack = { stack = stack.dropLast(1) },
                     onNearEnd = null,
-                    onEnterSeries = { id, ep -> stack = stack + Route.Series(id, ep, 0.0) },
+                    onEnterSeries = { id, ep, time -> stack = stack + Route.Series(id, ep, time) },
                 )
                 is Route.Series -> key(top.id, top.ep) {
                     VideoFeed(
@@ -99,11 +99,11 @@ fun Shell() {
                     kind = top.kind,
                     onBack = { stack = stack.dropLast(1) },
                     onOpen = { id, ep, time -> stack = stack + Route.Series(id, ep, time) },
-                    onSeries = { id, ep -> stack = stack + Route.Series(id, ep, 0.0) },
+                    onSeries = { id, ep, time -> stack = stack + Route.Series(id, ep, time) },
                 )
                 Route.Settings -> SettingsScreen { stack = stack.dropLast(1) }
                 null -> when (tab) {
-                    Tab.Home -> HomeFeed({}, onEnterSeries = { id, ep -> stack = stack + Route.Series(id, ep, 0.0) })
+                    Tab.Home -> HomeFeed({}, onEnterSeries = { id, ep, time -> stack = stack + Route.Series(id, ep, time) })
                     Tab.Search -> SearchScreen(
                         onOpen = { ids, index -> stack = stack + Route.Feed(ids, index, 1, 0.0) },
                         onRanks = { stack = stack + Route.Ranks },
