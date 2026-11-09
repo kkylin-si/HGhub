@@ -149,13 +149,7 @@ jobs:
           ver="$(sed -n 's/.*versionName = "\(.*\)".*/\1/p' native/android/app/build.gradle.kts)"
           tag="mobile-v${ver}"
           ls -lh dist
-          notes=$(cat <<EOF
-原生移动端 ${ver}，包名 app.hghub.mobile。
-
-- Android：已签名，可直接安装
-- iOS：未签名 IPA，需要自行签名后安装
-EOF
-)
+          notes="原生移动端 ${ver}，包名 app.hghub.mobile。Android 已签名，可直接安装。iOS 是未签名 IPA，需要自行签名后安装。"
           gh release view "$tag" >/dev/null 2>&1 && exists=1 || exists=0
           if [ "$exists" -eq 1 ]; then
             gh release upload "$tag" dist/* --clobber
