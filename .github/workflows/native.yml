@@ -52,14 +52,30 @@ jobs:
           KS="$RUNNER_TEMP/release.keystore"
           echo "$KEYSTORE_BASE64" | base64 -d > "$KS"
           export HGHUB_KEYSTORE="$KS"
-          chmod +x gradlew
+          ZIP="$RUNNER_TEMP/gradle.zip"
+          urls=(
+            "https://mirrors.cloud.tencent.com/gradle/gradle-8.11.1-bin.zip"
+            "https://mirrors.huaweicloud.com/gradle/gradle-8.11.1-bin.zip"
+            "https://services.gradle.org/distributions/gradle-8.11.1-bin.zip"
+          )
+          ok=0
+          for url in "${urls[@]}"; do
+            echo "下载 Gradle: $url"
+            if curl -fL --retry 3 --retry-delay 5 --connect-timeout 20 --max-time 180 -o "$ZIP" "$url"; then
+              ok=1
+              break
+            fi
+          done
+          test "$ok" -eq 1
+          rm -rf "$RUNNER_TEMP/gradle-8.11.1"
+          unzip -q "$ZIP" -d "$RUNNER_TEMP"
           n=0
-          until ./gradlew :app:assembleRelease --no-daemon; do
+          until "$RUNNER_TEMP/gradle-8.11.1/bin/gradle" :app:assembleRelease --no-daemon; do
             n=$((n + 1))
             if [ "$n" -ge 3 ]; then
               exit 1
             fi
-            echo "Gradle 失败，20 秒后重试 ($n/3)"
+            echo "编译失败，20 秒后重试 ($n/3)"
             sleep 20
           done
           rm -f "$KS"
