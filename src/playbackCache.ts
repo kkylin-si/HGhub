@@ -64,7 +64,7 @@ const sameRendition = (selected: Rendition | null, loaded: { id: number; groupId
 
 /** One serial VOD queue for video and selected audio/subtitles, including their dependencies. */
 export function attachPlaybackCache(hls: Hls | null, video: HTMLVideoElement, isActive: () => boolean, report: (ranges: CacheRange[]) => void, nativePlaylist?: string, subtitlesEnabled: () => boolean = () => true) {
-  let stopped = false, version = 0, running = false, blockedUntil = -1, revision = -1;
+  let stopped = false, version = 0, running = false, blockedUntil = -1, revision = -1, enabled = false;
   let timer: number | undefined;
   let diskRanges: CacheRange[] = [];
   const tracks: Record<string, Segment[]> = { main: [], audio: [], subtitle: [] };
@@ -79,7 +79,7 @@ export function attachPlaybackCache(hls: Hls | null, video: HTMLVideoElement, is
     const old = session; session = undefined;
     if (old) void old.ready.then(() => api.playbackCacheStop(old.id)).catch(() => {});
   };
-  const emit = () => { if (!stopped) report(mergeCacheRanges([...diskRanges, ...bufferRanges(video)])); };
+  const emit = () => { if (!stopped) report(enabled ? mergeCacheRanges([...diskRanges, ...bufferRanges(video)]) : []); };
   const wake = (delay = 250) => { if (timer !== undefined) clearTimeout(timer); if (!stopped) timer = window.setTimeout(() => { void run(); }, delay); };
   const reset = () => { version++; stopSession(); blockedUntil = -1; failures.clear(); diskRanges = []; emit(); wake(); restartNative?.(); };
   const activity = () => { if (!isActive()) { version++; stopSession(); } else reset(); };
@@ -98,8 +98,9 @@ export function attachPlaybackCache(hls: Hls | null, video: HTMLVideoElement, is
     try {
       const status = await api.playbackCacheStatus();
       if (stopped || current !== version || !isActive()) return;
-      if (revision !== status.revision) { revision = status.revision; reset(); current = version; }
-      if (!status.max_mib) { stopSession(); diskRanges = []; emit(); return; }
+      if (revision !== status.revision) { revision = status.revision; enabled = !!status.max_mib; reset(); current = version; }
+      if (!status.max_mib) { enabled = false; stopSession(); diskRanges = []; emit(); return; }
+      enabled = true;
       const snapshot = [...tracks.main, ...tracks.audio, ...(subtitlesEnabled() ? tracks.subtitle : [])].sort((a, b) => a.start - b.start);
       if (!snapshot.length) { emit(); return; }
       const unique = new Map(snapshot.flatMap(resources).map(resource => [cacheKey(resource), resource]));
@@ -260,18 +261,19 @@ export function attachPlaybackCache(hls: Hls | null, video: HTMLVideoElement, is
     finally { nativeRunning = false; }
   };
   if (!hls && nativePlaylist) restartNative = () => { void loadNative(); };
+  const onCacheChange = () => { enabled = false; reset(); };
   video.addEventListener("seeking", reset);
   video.addEventListener("subtitle-preference", subtitlePreference);
   video.addEventListener("progress", emit);
   video.addEventListener("playback-activity", activity);
-  window.addEventListener("playback-cache-change", reset);
+  window.addEventListener("playback-cache-change", onCacheChange);
   wake();
   return () => {
     stopped = true; version++; stopSession(); if (timer !== undefined) clearTimeout(timer); abort.abort();
     hls?.off(Hls.Events.LEVEL_LOADED, levelLoaded); hls?.off(Hls.Events.AUDIO_TRACK_SWITCHING, audioSwitching); hls?.off(Hls.Events.AUDIO_TRACK_LOADED, audioLoaded);
     hls?.off(Hls.Events.SUBTITLE_TRACK_SWITCH, subtitleSwitching); hls?.off(Hls.Events.SUBTITLE_TRACK_LOADED, subtitleLoaded);
     video.removeEventListener("seeking", reset); video.removeEventListener("subtitle-preference", subtitlePreference); video.removeEventListener("progress", emit); video.removeEventListener("playback-activity", activity);
-    window.removeEventListener("playback-cache-change", reset); report([]);
+    window.removeEventListener("playback-cache-change", onCacheChange); report([]);
   };
 }
 
@@ -279,7 +281,7 @@ export function attachPlaybackCache(hls: Hls | null, video: HTMLVideoElement, is
 export function attachDirectCache(proxyUrl: string, video: HTMLVideoElement, isActive: () => boolean, report: (ranges: CacheRange[]) => void) {
   let url = "";
   try { url = new URL(proxyUrl).searchParams.get("u") || ""; } catch { /* invalid source */ }
-  let stopped = false, running = false, total = 0, offset = 0, version = 0, validator = "", blockedCursor = -1, lastLimit = -1, revision = -1, lastCursor = -1, failures = 0;
+  let stopped = false, running = false, total = 0, offset = 0, version = 0, validator = "", blockedCursor = -1, lastLimit = -1, revision = -1, lastCursor = -1, failures = 0, enabled = false;
   let timer: number | undefined;
   let session: { id: string; ready: Promise<void> } | undefined;
   const block = 1024 * 1024;
@@ -287,9 +289,7 @@ export function attachDirectCache(proxyUrl: string, video: HTMLVideoElement, isA
     const old = session; session = undefined;
     if (old) void old.ready.then(() => api.playbackCacheStop(old.id)).catch(() => {});
   };
-  const emit = () => {
-    if (!stopped) report(mergeCacheRanges(bufferRanges(video)));
-  };
+  const emit = () => { if (!stopped) report(enabled ? mergeCacheRanges(bufferRanges(video)) : []); };
   const wake = (delay = 250) => { if (timer !== undefined) clearTimeout(timer); timer = window.setTimeout(() => { void run(); }, delay); };
   const run = async () => {
     if (running || stopped) return;
@@ -299,9 +299,10 @@ export function attachDirectCache(proxyUrl: string, video: HTMLVideoElement, isA
     try {
       const status = await api.playbackCacheStatus();
       if (stopped || current !== version || !isActive()) return;
-      if (revision !== status.revision) { revision = status.revision; reset(); current = version; }
+      if (revision !== status.revision) { revision = status.revision; enabled = !!status.max_mib; reset(); current = version; }
       const { max_mib } = status;
-      if (!max_mib) { stopSession(); return; }
+      if (!max_mib) { enabled = false; stopSession(); emit(); return; }
+      enabled = true;
       if (lastLimit !== max_mib) { lastLimit = max_mib; blockedCursor = -1; }
       if (failures >= 3) return;
       if (!total) {
@@ -358,7 +359,8 @@ export function attachDirectCache(proxyUrl: string, video: HTMLVideoElement, isA
   video.addEventListener("progress", emit);
   video.addEventListener("seeking", seeking);
   video.addEventListener("playback-activity", activity);
-  window.addEventListener("playback-cache-change", reset);
+  const onCacheChange = () => { enabled = false; emit(); reset(); };
+  window.addEventListener("playback-cache-change", onCacheChange);
   wake();
-  return () => { stopped = true; version++; stopSession(); if (timer !== undefined) clearTimeout(timer); video.removeEventListener("progress", emit); video.removeEventListener("seeking", seeking); video.removeEventListener("playback-activity", activity); window.removeEventListener("playback-cache-change", reset); report([]); };
+  return () => { stopped = true; version++; stopSession(); if (timer !== undefined) clearTimeout(timer); video.removeEventListener("progress", emit); video.removeEventListener("seeking", seeking); video.removeEventListener("playback-activity", activity); window.removeEventListener("playback-cache-change", onCacheChange); report([]); };
 }

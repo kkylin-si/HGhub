@@ -238,5 +238,35 @@ try {
     await tick(500); assert(rejectProbe); config.max_mib = 0; config.revision++; window.dispatchEvent(new Event('playback-cache-change')); await tick(500);
     assert(stops.length > 0); assert.equal(downloads.length, 0); dispose(); await flush();
   });
+  await check('zero capacity does not paint the player buffer as cache', async () => {
+    config.max_mib = 0;
+    const video = new Video(), engine = new Engine(); let ranges = [{ start: 1, end: 2 }];
+    video.buffered = { length: 1, start: () => 0, end: () => 30 };
+    const dispose = attachPlaybackCache(engine, video, () => active, value => ranges = value);
+    engine.details(plain); video.dispatchEvent(new Event('progress')); await tick(5000);
+    assert.equal(downloads.length, 0); assert.deepEqual(ranges, []);
+    dispose(); await flush();
+  });
+  await check('turning capacity to zero clears an existing cache indicator', async () => {
+    const video = new Video(), engine = new Engine(); let ranges = [];
+    const dispose = attachPlaybackCache(engine, video, () => active, value => ranges = value);
+    engine.details(plain); await tick(500); assert.deepEqual(ranges, [{ start: 0, end: 12 }]);
+    video.buffered = { length: 1, start: () => 0, end: () => 30 };
+    config.max_mib = 0; config.revision++; cached.clear(); window.dispatchEvent(new Event('playback-cache-change'));
+    video.dispatchEvent(new Event('progress')); await tick(5000);
+    assert.equal(downloads.length, 3); assert.deepEqual(ranges, []);
+    dispose(); await flush();
+  });
+  await check('direct playback at zero does not probe or show buffer', async () => {
+    config.max_mib = 0; let probes = 0;
+    const original = globalThis.cacheFixtureApi.playbackCacheProbe;
+    globalThis.cacheFixtureApi.playbackCacheProbe = async () => { probes++; return { total: 1024, tag: 'etag' }; };
+    const video = new Video(); let ranges = [{ start: 0, end: 1 }];
+    video.buffered = { length: 1, start: () => 0, end: () => 40 };
+    const dispose = attachDirectCache(proxy('movie.mp4'), video, () => active, value => ranges = value);
+    video.dispatchEvent(new Event('progress')); await tick(5000);
+    assert.equal(probes, 0); assert.equal(downloads.length, 0); assert.deepEqual(ranges, []);
+    dispose(); await flush(); globalThis.cacheFixtureApi.playbackCacheProbe = original;
+  });
   console.log(`Playback cache checks: ${passed} passed`);
 } finally { Date.now = realNow; await rm(temporary, { recursive: true, force: true }); }
