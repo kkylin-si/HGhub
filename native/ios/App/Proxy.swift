@@ -176,6 +176,9 @@ final class MediaProxy: ObservableObject {
     }
 
     private func sendAll(_ fd: Int32, _ data: Data) {
+        // 切換分頁會讓播放器關閉連線；此時僅讓 send 回報錯誤，避免 SIGPIPE 終止整個 App。
+        var noSigPipe: Int32 = 1
+        guard setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size)) == 0 else { return }
         data.withUnsafeBytes { raw in
             guard let base = raw.baseAddress else { return }
             var sent = 0
