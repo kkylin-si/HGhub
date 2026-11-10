@@ -69,6 +69,8 @@ export const api = {
       strict_security?: boolean;
       cli_relaxed?: boolean;
     }>("app_boot"),
+  securityCidrsGet: () => call<string>("security_cidrs_get"),
+  securityCidrsSet: (cidrs: string) => call<string>("security_cidrs_set", { cidrs }),
   securitySet: (strict: boolean) => call<boolean>("security_set", { strict }),
   login: (username: string, password: string) =>
     call<{ user: User }>("api_login", { username, password }),

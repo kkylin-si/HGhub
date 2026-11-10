@@ -15,6 +15,9 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
   const [clearing, setClearing] = useState(false);
   const [lineOpen, setLineOpen] = useState(false);
   const [lineBase, setLineBase] = useState("");
+  const [cidrs, setCidrs] = useState("");
+  const [cidrsReady, setCidrsReady] = useState(false);
+  const [cidrsSaving, setCidrsSaving] = useState(false);
   const [checking, setChecking] = useState(false);
   const [update, setUpdate] = useState<UpdateInfo | null>(null);
   const playbackLog = usePlaybackLog();
@@ -24,6 +27,10 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
     api.lineState().then((s) => setLineBase(s.base)).catch(() => {});
   };
   useEffect(readLine, []);
+  useEffect(() => {
+    api.securityCidrsGet().then((value) => { setCidrs(value); setCidrsReady(true); })
+      .catch(() => toast("无法读取 CIDR 例外设置", "info"));
+  }, [toast]);
   useEffect(() => { void initPlaybackLog(); }, []);
 
   const checkUpdate = async () => {
@@ -136,6 +143,19 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
                 label="严格安全模式"
               />
             </div>
+            {strictSecurity && <div className="px-3.5 py-3">
+              <label htmlFor="allowed-cidrs" className="text-[12.5px] text-on">允许连接的 IP CIDR 例外</label>
+              <div className="text-[10.5px] text-mut mt-1">IPv4 / IPv6 网段以英文逗号分隔，例如 fd00::/8, 10.20.0.0/16。198.18.0.0/15 已默认放行，无需填写。列表中的内网和保留地址也可连接，请仅填写可信网段。</div>
+              <div className="flex gap-2 mt-2">
+                <input id="allowed-cidrs" type="text" value={cidrs} onChange={(e) => setCidrs(e.target.value)} disabled={!cidrsReady || cidrsSaving} placeholder="留空表示无额外例外" className="min-w-0 flex-1 rounded bg-s3 px-2 py-1 text-[12.5px] text-on" />
+                <button disabled={!cidrsReady || cidrsSaving} className="rounded bg-s3 px-3 py-1 text-[12.5px] text-on disabled:opacity-50" onClick={() => {
+                  setCidrsSaving(true);
+                  void api.securityCidrsSet(cidrs).then((saved) => { setCidrs(saved); toast("CIDR 例外已保存", "ok"); })
+                    .catch((e) => toast((e as Error).message || "CIDR 例外保存失败", "info"))
+                    .finally(() => setCidrsSaving(false));
+                }}>保存</button>
+              </div>
+            </div>}
             {/* 打不开时先点这里：把 DNS / 代理 / HTTP 结果复制给维护者 */}
             <button onClick={async () => {
               try {

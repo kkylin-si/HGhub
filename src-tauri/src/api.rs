@@ -312,6 +312,18 @@ pub async fn security_set(strict: bool) -> Result<bool, String> {
 }
 
 #[tauri::command]
+pub async fn security_cidrs_get() -> String {
+    crate::network_policy::allowed_cidrs()
+}
+
+#[tauri::command]
+pub async fn security_cidrs_set(cidrs: String) -> Result<String, String> {
+    let saved = crate::network_policy::set_allowed_cidrs(&cidrs)?;
+    crate::net::refresh_client();
+    Ok(saved)
+}
+
+#[tauri::command]
 pub async fn api_login(
     state: State<'_, Api>,
     username: String,

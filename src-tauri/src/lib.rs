@@ -137,6 +137,8 @@ pub fn run() {
             playback_log::playback_log_write,
             playback_log::playback_log_read,
             api::security_set,
+            api::security_cidrs_get,
+            api::security_cidrs_set,
             api::debug_log,
             api::net_diag,
             api::line_state,
