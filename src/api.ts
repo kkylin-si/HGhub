@@ -99,7 +99,16 @@ export const api = {
   commentSend: (id: number, ep: number, text: string, replyId?: number) =>
     call<unknown>("api_comment_send", { id, ep, text, replyId: replyId ?? null }),
 
-  clearCache: () => invoke<void>("cache_clear"),
+  clearCache: async () => { try { await invoke<void>("cache_clear"); } finally { window.dispatchEvent(new Event("playback-cache-change")); } },
+  playbackCacheStatus: () => call<{ max_mib: number; bytes: number; revision: number }>("playback_cache_status"),
+  playbackCacheSet: async (maxMib: number) => { try { await call<void>("playback_cache_set", { maxMib }); } finally { window.dispatchEvent(new Event("playback-cache-change")); } },
+  playbackCacheContains: (urls: string[]) => call<boolean[]>("playback_cache_contains", { urls }),
+  playbackCachePrefetch: (url: string, protectedUrls: string[], sessionId: string, range?: { start: number; end: number }, validator?: string) => call<boolean>("playback_cache_prefetch", { url, range: range ?? null, validator: validator ?? null, protectedUrls, sessionId }),
+  playbackCacheObserved: (urls: string[]) => call<number | null>("playback_cache_observed", { urls }),
+  playbackCacheProbe: (url: string, sessionId: string) => call<{ total: number; tag: string }>("playback_cache_probe", { url, sessionId }),
+  playbackCacheCursor: (url: string) => call<number>("playback_cache_cursor", { url }),
+  playbackCacheStart: (sessionId: string) => call<void>("playback_cache_start", { sessionId }),
+  playbackCacheStop: (sessionId: string) => call<void>("playback_cache_stop", { sessionId }),
   netDiag: () => invoke<Record<string, unknown>>("net_diag"),
   postLike: (id: number, on: boolean) => invoke<unknown>("api_post_like", { id, on }),
   postCollect: (id: number, on: boolean) => invoke<unknown>("api_post_collect", { id, on }),
@@ -215,10 +224,11 @@ export const dur = (s?: number | string) => {
 
 /** 非 m3u8 媒体（mp4 等）走 /seg 原样透传 */
 export function directMedia(url: string): string {
-  return `${LOCAL}/seg?u=${encodeURIComponent(url)}`;
+  return `${LOCAL}/seg?u=${encodeURIComponent(url)}&direct=1`;
 }
 
-/** 按扩展名选择代理方式：m3u8 → 播放列表改写；其它 → 原样透传 */
+/** 已知直链文件走字节范围代理；扩展名未知时保持 HLS 播放路径。 */
 export function mediaUrl(url: string): string {
-  return /\.m3u8(\?|$)/i.test(url) ? playlist(url) : directMedia(url);
+  const path = url.split(/[?#]/, 1)[0];
+  return /\.(?:mp4|m4v|webm|mov|ogv)$/i.test(path) ? directMedia(url) : playlist(url);
 }

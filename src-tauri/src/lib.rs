@@ -4,6 +4,7 @@ mod logging;
 #[cfg(target_os = "macos")]
 mod macos_titlebar;
 mod media;
+mod media_cache;
 mod net;
 mod network_policy;
 mod playback_log;
@@ -58,6 +59,7 @@ pub fn run() {
                 // 上次选择的线路（设置 → 线路）在启动时恢复
                 net::bind_base(&dir);
                 playback_log::bind(&dir);
+                media_cache::bind(&dir);
                 let state: tauri::State<Api> = app.state();
                 state.session.bind(dir);
             }
@@ -106,6 +108,7 @@ pub fn run() {
                 );
                 return;
             }
+            let range = request.headers().get("Range").and_then(|v| v.to_str().ok()).map(str::to_string);
             let uri = request.uri().clone();
             let path = uri.path().to_string();
             let query = uri.query().unwrap_or("").to_string();
@@ -113,7 +116,7 @@ pub fn run() {
             // （Windows/Android 是 http://<scheme>.localhost，macOS/iOS/Linux 是 <scheme>://localhost）。
             // 它同时是 m3u8 分片/key 改写用的前缀，必须与前端 src/api.ts 的 LOCAL 一致。
             tauri::async_runtime::spawn(async move {
-                let mut resp = media::handle(&path, &query, media::LOCAL_ORIGIN).await;
+                let mut resp = media::handle(&path, &query, media::LOCAL_ORIGIN, range.as_deref()).await;
                 if let Some(origin) =
                     request_origin.and_then(|s| tauri::http::HeaderValue::from_str(&s).ok())
                 {
@@ -157,6 +160,15 @@ pub fn run() {
             api::api_rank,
             api::api_search,
             api::cache_clear,
+            api::playback_cache_status,
+            api::playback_cache_set,
+            api::playback_cache_prefetch,
+            api::playback_cache_observed,
+            api::playback_cache_probe,
+            api::playback_cache_cursor,
+            api::playback_cache_start,
+            api::playback_cache_stop,
+            api::playback_cache_contains,
             api::api_posts,
             api::api_post,
             api::api_post_like,

@@ -10,7 +10,189 @@ use aes::Aes128;
 use once_cell::sync::Lazy;
 use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
+use std::sync::atomic::{AtomicU64, Ordering};
+use sha2::{Digest, Sha256};
+
+static DOWNLOAD_LOCKS: Lazy<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn download_lock(url: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = DOWNLOAD_LOCKS.lock().unwrap();
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(url).and_then(Weak::upgrade) { return lock; }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(url.to_string(), Arc::downgrade(&lock));
+    lock
+}
+
+#[derive(Clone, Copy, Debug, serde::Deserialize)]
+pub struct ByteRange { pub start: u64, pub end: u64 }
+
+static OBSERVED_PLAYLISTS: Lazy<Mutex<HashMap<String, std::time::Instant>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+fn playlist_id(url: &str) -> String { format!("{:x}", Sha256::digest(url.as_bytes())) }
+fn observe_playlist(url: &str) {
+    if let Ok(mut entries) = OBSERVED_PLAYLISTS.lock() {
+        entries.retain(|_, at| at.elapsed() < std::time::Duration::from_secs(300));
+        if entries.len() >= 256 { entries.clear(); }
+        entries.insert(playlist_id(url), std::time::Instant::now());
+    }
+}
+pub fn latest_playlist(urls: &[String]) -> Option<usize> {
+    let entries = OBSERVED_PLAYLISTS.lock().ok()?;
+    urls.iter().enumerate().filter_map(|(i, url)| entries.get(&playlist_id(url)).filter(|at| at.elapsed() < std::time::Duration::from_secs(300)).map(|at| (i, at)))
+        .max_by_key(|(_, at)| **at).map(|(i, _)| i)
+}
+
+const DIRECT_BLOCK: u64 = 1024 * 1024;
+#[derive(Clone)]
+struct DirectInfo { total: u64, cursor: u64, etag: String, tag: String }
+static DIRECT_MEDIA: Lazy<Mutex<HashMap<String, DirectInfo>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static DIRECT_PROBE_FAILURES: Lazy<Mutex<HashMap<String, std::time::Instant>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+pub async fn probe_direct(url: &str) -> Result<(u64, String), String> {
+    let referer = format!("{}/", crate::net::base());
+    let mut response = crate::net::get_with_range(url, std::time::Duration::from_secs(20), None, Some(&referer), Some("bytes=0-0")).await?;
+    if response.status() != reqwest::StatusCode::PARTIAL_CONTENT { return Err("服务器不支持范围请求".into()); }
+    let (start, end, total) = response.headers().get(reqwest::header::CONTENT_RANGE).and_then(|v| v.to_str().ok())
+        .and_then(parse_content_range).ok_or("无效的 Content-Range")?;
+    if start != 0 || end != 0 || total > 9_007_199_254_740_991 { return Err("服务器返回的字节范围不匹配".into()); }
+    let etag = response.headers().get(reqwest::header::ETAG).and_then(|v| v.to_str().ok())
+        .filter(|tag| tag.starts_with('"') && tag.ends_with('"')).ok_or("服务器未提供强 ETag，无法安全复用文件块")?.to_string();
+    let tag = format!("{:x}", Sha256::digest(etag.as_bytes()));
+    let mut received = 0;
+    while let Some(chunk) = response.chunk().await.map_err(|_| "范围探测失败")? {
+        if chunk.len() > 1 - received { return Err("范围探测响应长度错误".into()); }
+        received += chunk.len();
+    }
+    if received != 1 { return Err("范围探测响应长度错误".into()); }
+    let mut direct = DIRECT_MEDIA.lock().map_err(|_| "范围状态锁失败")?;
+    if direct.len() >= 128 { direct.clear(); }
+    let cursor = direct.get(url).map_or(0, |entry| entry.cursor);
+    direct.insert(url.to_string(), DirectInfo { total, cursor, etag, tag: tag.clone() });
+    Ok((total, tag))
+}
+pub fn direct_cursor(url: &str) -> u64 {
+    DIRECT_MEDIA.lock().ok().and_then(|map| map.get(url).map(|entry| entry.cursor)).unwrap_or(0)
+}
+fn direct_cache_key(target: &str, range: ByteRange, tag: &str) -> String {
+    format!("{}\nvalidator={tag}", range_key(target, range))
+}
+fn direct_cache_read(target: &str, requested: ByteRange, total: u64, tag: &str) -> Option<(Option<String>, Vec<u8>)> {
+    if requested.start >= total { return None; }
+    let end = requested.end.min(total - 1);
+    if end < requested.start { return None; }
+    let end = end.min(requested.start.saturating_add(8 * 1024 * 1024 - 1));
+    let mut offset = requested.start / DIRECT_BLOCK * DIRECT_BLOCK;
+    let mut result = Vec::new(); let mut content_type = None;
+    while offset <= end {
+        let block_end = offset.saturating_add(DIRECT_BLOCK - 1).min(total - 1);
+        let entry = crate::media_cache::get_entry(&direct_cache_key(target, ByteRange { start: offset, end: block_end }, tag));
+        let Some((mime, saved_total, bytes)) = entry else { if result.is_empty() { return None; } break; };
+        if saved_total != Some(total) || bytes.len() as u64 != block_end - offset + 1 { return None; }
+        if content_type.is_none() { content_type = mime; }
+        let first = requested.start.saturating_sub(offset) as usize;
+        let last = (end.min(block_end) - offset + 1) as usize;
+        result.extend_from_slice(bytes.get(first..last)?);
+        offset = block_end + 1;
+    }
+    Some((content_type, result))
+}
+
+fn range_key(url: &str, range: ByteRange) -> String {
+    format!("{url}\nrange={}-{}", range.start, range.end)
+}
+
+fn parse_content_range(raw: &str) -> Option<(u64, u64, u64)> {
+    let (range, total) = raw.strip_prefix("bytes ")?.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let (start, end, total) = (start.parse().ok()?, end.parse().ok()?, total.parse().ok()?);
+    if start > end || end >= total { return None; }
+    Some((start, end, total))
+}
+
+fn valid_range_header(raw: &str) -> bool {
+    if raw.len() > 100 { return false; }
+    let Some(ranges) = raw.strip_prefix("bytes=") else { return false };
+    ranges.split(',').all(|range| {
+        let Some((start, end)) = range.split_once('-') else { return false };
+        if start.is_empty() { return end.parse::<u64>().is_ok_and(|n| n > 0); }
+        let Ok(start) = start.parse::<u64>() else { return false };
+        end.is_empty() || end.parse::<u64>().is_ok_and(|end| start <= end)
+    })
+}
+
+fn parse_bounded_range(raw: &str) -> Option<ByteRange> {
+    let (start, end) = raw.strip_prefix("bytes=")?.split_once('-')?;
+    let (start, end) = (start.parse().ok()?, end.parse().ok()?);
+    if start > end { return None; }
+    Some(ByteRange { start, end })
+}
+
+fn media_mime(url: &str, upstream: Option<String>) -> String {
+    if let Some(mime) = upstream.filter(|mime| !mime.eq_ignore_ascii_case("application/octet-stream")) { return mime; }
+    let path = url.split(['?', '#']).next().unwrap_or(url).to_ascii_lowercase();
+    let mime = if path.ends_with(".vtt") { "text/vtt" }
+        else if path.ends_with(".aac") { "audio/aac" }
+        else if path.ends_with(".m4a") { "audio/mp4" }
+        else if path.ends_with(".mp3") { "audio/mpeg" }
+        else if path.ends_with(".ts") { "video/mp2t" }
+        else if path.ends_with(".m4s") || path.ends_with(".mp4") { "video/mp4" }
+        else { "application/octet-stream" };
+    mime.to_string()
+}
+
+async fn prefetch_body(mut response: reqwest::Response) -> Result<Vec<u8>, String> {
+    const MAX: usize = 16 * 1024 * 1024;
+    if response.content_length().is_some_and(|length| length > MAX as u64) { return Err("缓存块超过 16 MiB".into()); }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| "分片下载失败")? {
+        if chunk.len() > MAX - bytes.len() { return Err("缓存块超过 16 MiB".into()); }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+pub async fn prefetch_segment(url: &str, range: Option<ByteRange>, validator: Option<&str>, protected_urls: &[String]) -> Result<bool, String> {
+    crate::network_policy::parse_target(url)?;
+    let Some(generation) = crate::media_cache::generation() else { return Ok(false) };
+    let direct = if let Some(validator) = validator {
+        let info = DIRECT_MEDIA.lock().ok().and_then(|map| map.get(url).cloned()).ok_or("媒体文件需要重新探测")?;
+        if info.tag != validator { return Err("媒体文件已改变，请重新加载".into()); }
+        Some(info)
+    } else { None };
+    let cache_key = range.map(|range| match &direct { Some(info) => direct_cache_key(url, range, &info.tag), None => range_key(url, range) }).unwrap_or_else(|| url.to_string());
+    let lock = download_lock(&cache_key);
+    let _guard = lock.lock().await;
+    if crate::media_cache::contains(&cache_key) { return Ok(true); }
+    if let Some(range) = range {
+        if range.start > range.end || range.end.saturating_sub(range.start) >= 16 * 1024 * 1024 { return Err("无效的缓存范围".into()); }
+        let header = format!("bytes={}-{}", range.start, range.end);
+        let referer = format!("{}/", crate::net::base());
+        let response = crate::net::get_with_range(url, std::time::Duration::from_secs(20), None, Some(&referer), Some(&header)).await?;
+        if response.status() != reqwest::StatusCode::PARTIAL_CONTENT { return Err("服务器不支持字节范围".into()); }
+        let (start, end, total) = response.headers().get(reqwest::header::CONTENT_RANGE).and_then(|v| v.to_str().ok())
+            .and_then(parse_content_range).ok_or("无效的 Content-Range")?;
+        if let Some(info) = &direct {
+            if total != info.total || response.headers().get(reqwest::header::ETAG).and_then(|v| v.to_str().ok()) != Some(info.etag.as_str()) { return Err("媒体文件已改变，请重新加载".into()); }
+        }
+        if start != range.start || end != range.end { return Err("服务器返回的字节范围不匹配".into()); }
+        let mime = Some(media_mime(url, response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).map(str::to_string)));
+        let bytes = prefetch_body(response).await?;
+        if bytes.len() as u64 != end - start + 1 { return Err("字节范围响应长度不匹配".into()); }
+        return Ok(crate::media_cache::put_entry(&cache_key, mime, Some(total), &bytes, generation, protected_urls));
+    }
+    // A foreground request may have completed while prefetch waited for the same object.
+    let memory = KEY_CACHE.lock().ok().and_then(|cache| cache.get(url).cloned())
+        .or_else(|| SEG_CACHE.lock().ok().and_then(|cache| cache.get(url).cloned()));
+    if let Some((mime, bytes)) = memory { return Ok(crate::media_cache::put(&cache_key, Some(mime), &bytes, generation, protected_urls)); }
+    let referer = format!("{}/", crate::net::base());
+    let response = crate::net::get(url, std::time::Duration::from_secs(20), None, Some(&referer)).await?;
+    if !response.status().is_success() { return Err(format!("HTTP {}", response.status())); }
+    let mime = Some(media_mime(url, response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|value| value.to_str().ok()).map(str::to_string)));
+    let bytes = prefetch_body(response).await?;
+    Ok(crate::media_cache::put(&cache_key, mime, &bytes, generation, protected_urls))
+}
+
 use tauri::http::{Response, StatusCode};
 
 /// 本平台自定义协议的完整基址。
@@ -26,9 +208,10 @@ pub const LOCAL_ORIGIN: &str = "hg://localhost";
 const IMG_KEY: &[u8] = b"f5d965df75336270";
 const IMG_IV: &[u8] = b"97b60394abc2fbe1";
 
+static MEMORY_REVISION: AtomicU64 = AtomicU64::new(0);
 static IMG_CACHE: Lazy<Mutex<HashMap<String, Arc<Vec<u8>>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
-static PL_CACHE: Lazy<Mutex<HashMap<String, Arc<String>>>> =
+static PL_CACHE: Lazy<Mutex<HashMap<String, (std::time::Instant, Arc<String>)>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 static KEY_CACHE: Lazy<Mutex<HashMap<String, (String, Arc<Vec<u8>>)>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
@@ -105,6 +288,7 @@ fn image_kind(buf: &[u8]) -> Option<&'static str> {
 
 /// 取封面：命中缓存直接返回，否则下载并按需解密。
 pub async fn load_image(url: &str) -> Result<(String, Arc<Vec<u8>>), String> {
+    let revision = MEMORY_REVISION.load(Ordering::SeqCst);
     if let Some(hit) = IMG_CACHE.lock().unwrap().get(url).cloned() {
         let kind = image_kind(&hit).unwrap_or("image/jpeg");
         return Ok((kind.to_string(), hit));
@@ -118,7 +302,7 @@ pub async fn load_image(url: &str) -> Result<(String, Arc<Vec<u8>>), String> {
     };
     let kind = image_kind(&plain).unwrap_or("image/jpeg").to_string();
     let arc = Arc::new(plain);
-    cache_put(&IMG_CACHE, url.to_string(), arc.clone(), IMG_CACHE_MAX);
+    if MEMORY_REVISION.load(Ordering::SeqCst) == revision { cache_put(&IMG_CACHE, url.to_string(), arc.clone(), IMG_CACHE_MAX); }
     Ok((kind, arc))
 }
 
@@ -194,8 +378,9 @@ fn rewrite_uri_attr(line: &str, prefix: &str) -> String {
 /// 取 m3u8 并把 key / 子列表 / 分片地址改写到本地协议。
 pub async fn load_playlist(url: &str, prefix: &str) -> Result<Arc<String>, String> {
     let cache_key = format!("{prefix}|{url}");
-    if let Some(hit) = PL_CACHE.lock().unwrap().get(&cache_key).cloned() {
-        return Ok(hit);
+    let revision = MEMORY_REVISION.load(Ordering::SeqCst);
+    if let Some((expires, hit)) = PL_CACHE.lock().unwrap().get(&cache_key).cloned() {
+        if std::time::Instant::now() < expires { return Ok(hit); }
     }
     let (_, bytes) = fetch_bytes(url).await?;
     let text = std::str::from_utf8(&bytes).map_err(|_| "播放列表不是 UTF-8 文本")?;
@@ -203,7 +388,10 @@ pub async fn load_playlist(url: &str, prefix: &str) -> Result<Arc<String>, Strin
         return Err("响应不是 HLS 播放列表".into());
     }
     let arc = Arc::new(rewrite_playlist(url, text, prefix));
-    cache_put(&PL_CACHE, cache_key, arc.clone(), PL_CACHE_MAX);
+    let ttl = if text.lines().any(|line| line.trim() == "#EXT-X-ENDLIST") { 300 } else { 2 };
+    if MEMORY_REVISION.load(Ordering::SeqCst) == revision {
+        cache_put(&PL_CACHE, cache_key, (std::time::Instant::now() + std::time::Duration::from_secs(ttl), arc.clone()), PL_CACHE_MAX);
+    }
     Ok(arc)
 }
 
@@ -261,6 +449,11 @@ fn absolutize_uri_in_attr(base: &str, line: &str) -> String {
 
 /// 加载分片或 AES Key（带内存缓存，避免拖动进度条时重复拉取同一 Key 或分片导致卡顿）。
 pub async fn load_segment(url: &str) -> Result<(Option<String>, Arc<Vec<u8>>), String> {
+    let revision = MEMORY_REVISION.load(Ordering::SeqCst);
+    crate::network_policy::parse_target(url)?;
+    let lock = download_lock(url);
+    let _guard = lock.lock().await;
+    if let Some((mime, bytes)) = crate::media_cache::get(url) { return Ok((mime, Arc::new(bytes))); }
     if let Some((ctype, hit)) = KEY_CACHE.lock().unwrap().get(url).cloned() {
         return Ok((Some(ctype), hit));
     }
@@ -268,21 +461,13 @@ pub async fn load_segment(url: &str) -> Result<(Option<String>, Arc<Vec<u8>>), S
         return Ok((Some(ctype), hit));
     }
     let (ctype, bytes) = fetch_bytes(url).await?;
-    let mime = ctype.clone().unwrap_or_else(|| {
-        let p = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
-        if p.ends_with(".ts") {
-            "video/mp2t".to_string()
-        } else if p.ends_with(".m4s") || p.ends_with(".mp4") {
-            "video/mp4".to_string()
-        } else {
-            "application/octet-stream".to_string()
-        }
-    });
+    let mime = media_mime(url, ctype.clone());
     let len = bytes.len();
     let arc = Arc::new(bytes);
-    if len <= 65536 {
+    let playlist = mime.to_ascii_lowercase().contains("mpegurl") || arc.starts_with(b"#EXTM3U") || arc.starts_with(b"\xef\xbb\xbf#EXTM3U");
+    if !playlist && MEMORY_REVISION.load(Ordering::SeqCst) == revision && len <= 65536 {
         cache_put(&KEY_CACHE, url.to_string(), (mime.clone(), arc.clone()), KEY_CACHE_MAX);
-    } else if len <= SEG_CACHE_MAX_BYTES {
+    } else if !playlist && MEMORY_REVISION.load(Ordering::SeqCst) == revision && len <= SEG_CACHE_MAX_BYTES {
         cache_put(&SEG_CACHE, url.to_string(), (mime.clone(), arc.clone()), SEG_CACHE_MAX);
     }
     Ok((Some(mime), arc))
@@ -290,6 +475,7 @@ pub async fn load_segment(url: &str) -> Result<(Option<String>, Arc<Vec<u8>>), S
 
 /// 清空封面 / 播放列表 / 分片内存缓存
 pub fn clear_caches() {
+    MEMORY_REVISION.fetch_add(1, Ordering::SeqCst);
     if let Ok(mut g) = IMG_CACHE.lock() { g.clear(); }
     if let Ok(mut g) = PL_CACHE.lock() { g.clear(); }
     if let Ok(mut g) = KEY_CACHE.lock() { g.clear(); }
@@ -323,13 +509,14 @@ fn segment_response(
         || bytes.starts_with(b"#EXTM3U")
         || bytes.starts_with(b"\xef\xbb\xbf#EXTM3U");
     if playlist {
+        observe_playlist(target);
         return match std::str::from_utf8(&bytes) {
             Ok(text) => respond(
                 200,
                 "application/vnd.apple.mpegurl",
                 rewrite_playlist(target, text, origin).into_bytes(),
-                // Rewriting nested URIs does not require disabling the upstream cache policy.
-                "public, max-age=3600",
+                // Media playlists can change even when their URL stays the same.
+                "no-store",
             ),
             Err(_) => respond(
                 502,
@@ -343,15 +530,144 @@ fn segment_response(
         200,
         ctype.unwrap_or("application/octet-stream"),
         bytes,
-        "public, max-age=3600",
+        if crate::media_cache::generation().is_some() { "no-store" } else { "public, max-age=3600" },
     )
+}
+
+async fn range_response(target: &str, raw_range: &str, is_direct: bool) -> Response<Vec<u8>> {
+    let cache_generation = crate::media_cache::generation();
+    if !valid_range_header(raw_range) {
+        return respond(400, "text/plain", b"invalid range".to_vec(), "no-store");
+    }
+    if let Err(e) = crate::network_policy::parse_target(target) { return respond(403, "text/plain", e.into_bytes(), "no-store"); }
+    let bounded = parse_bounded_range(raw_range);
+    let probe_allowed = DIRECT_PROBE_FAILURES.lock().ok().is_none_or(|failures| failures.get(&playlist_id(target)).is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(30)));
+    if is_direct && probe_allowed && crate::media_cache::generation().is_some() && DIRECT_MEDIA.lock().ok().is_some_and(|map| !map.contains_key(target)) {
+        // Probe before starting a large open-ended request; unsupported origins retain the original path.
+        if probe_direct(target).await.is_err() {
+            if let Ok(mut failures) = DIRECT_PROBE_FAILURES.lock() {
+                failures.retain(|_, at| at.elapsed() < std::time::Duration::from_secs(30));
+                if failures.len() >= 128 { failures.clear(); }
+                failures.insert(playlist_id(target), std::time::Instant::now());
+            }
+        }
+    }
+    let start = if raw_range.contains(',') { None } else { raw_range.strip_prefix("bytes=").and_then(|value| value.split_once('-')).and_then(|(start, _)| start.parse::<u64>().ok()) };
+    let direct = if is_direct && crate::media_cache::generation().is_some() {
+        if let Ok(mut map) = DIRECT_MEDIA.lock() {
+            map.get_mut(target).map(|entry| { if let Some(start) = start { entry.cursor = start; } entry.clone() })
+        } else { None }
+    } else { None };
+    if let (Some(info), Some(start)) = (&direct, start) {
+        let requested = ByteRange { start, end: bounded.map_or(info.total.saturating_sub(1), |r| r.end) };
+        if let Some((mime, bytes)) = direct_cache_read(target, requested, info.total, &info.tag) {
+            let end = start + bytes.len() as u64 - 1;
+            return byte_response(206, mime.as_deref(), Some(&format!("bytes {start}-{end}/{}", info.total)), bytes);
+        }
+    }
+    let cache_key = bounded.map(|r| range_key(target, r));
+    let direct_key = match (&direct, start) {
+        (Some(info), Some(start)) if start < info.total => {
+            let first = start / DIRECT_BLOCK * DIRECT_BLOCK;
+            Some(direct_cache_key(target, ByteRange { start: first, end: first.saturating_add(DIRECT_BLOCK - 1).min(info.total - 1) }, &info.tag))
+        }
+        _ => None,
+    };
+    let lock = download_lock(direct_key.as_deref().or(cache_key.as_deref()).unwrap_or(target));
+    let _guard = lock.lock().await;
+    if let (Some(info), Some(start)) = (&direct, start) {
+        let requested = ByteRange { start, end: bounded.map_or(info.total.saturating_sub(1), |r| r.end) };
+        if let Some((mime, bytes)) = direct_cache_read(target, requested, info.total, &info.tag) {
+            let end = start + bytes.len() as u64 - 1;
+            return byte_response(206, mime.as_deref(), Some(&format!("bytes {start}-{end}/{}", info.total)), bytes);
+        }
+    }
+    if !is_direct {
+        if let (Some(range), Some(key)) = (bounded, cache_key.as_deref()) {
+            if let Some((mime, Some(total), bytes)) = crate::media_cache::get_entry(key) {
+                if range.end < total && bytes.len() as u64 == range.end - range.start + 1 {
+                    return byte_response(206, mime.as_deref(), Some(&format!("bytes {}-{}/{total}", range.start, range.end)), bytes);
+                }
+            }
+        }
+    }
+    let referer = format!("{}/", crate::net::base());
+    let capped = match (&direct, start) {
+        (Some(info), Some(start)) if start < info.total => {
+            let end = bounded.map_or(info.total - 1, |range| range.end.min(info.total - 1)).min(start.saturating_add(8 * 1024 * 1024 - 1));
+            Some(format!("bytes={start}-{end}"))
+        }
+        _ => None,
+    };
+    match crate::net::get_with_range(target, std::time::Duration::from_secs(20), None, Some(&referer), Some(capped.as_deref().unwrap_or(raw_range))).await {
+        Ok(response) => {
+            let status = response.status().as_u16();
+            let content_range = response.headers().get(reqwest::header::CONTENT_RANGE).and_then(|v| v.to_str().ok()).map(str::to_string);
+            let same_direct = direct.as_ref().is_some_and(|info| response.headers().get(reqwest::header::ETAG).and_then(|v| v.to_str().ok()) == Some(info.etag.as_str()));
+            if direct.is_some() && status == 206 && !same_direct {
+                if let Ok(mut map) = DIRECT_MEDIA.lock() { map.remove(target); }
+            }
+            let mime = response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).map(str::to_string);
+            match response.bytes().await {
+                Ok(bytes) => {
+                    if status == 206 {
+                        let valid = if raw_range.contains(',') {
+                            mime.as_deref().is_some_and(|value| value.to_ascii_lowercase().starts_with("multipart/byteranges"))
+                        } else {
+                            let expected = capped.as_deref().and_then(parse_bounded_range).or(bounded);
+                            content_range.as_deref().and_then(parse_content_range).is_some_and(|(actual_start, end, _)| {
+                                bytes.len() as u64 == end - actual_start + 1
+                                    && start.is_none_or(|requested| actual_start == requested)
+                                    && expected.is_none_or(|requested| actual_start == requested.start && end <= requested.end)
+                            })
+                        };
+                        if !valid { return respond(502, "text/plain", b"invalid upstream range".to_vec(), "no-store"); }
+                    }
+                    if status == 206 {
+                        if let (Some(generation), Some((first, last, total))) = (cache_generation, content_range.as_deref().and_then(parse_content_range)) {
+                            if let Some(info) = direct.as_ref().filter(|info| same_direct && info.total == total) {
+                                // Save complete aligned blocks already fetched for playback, avoiding a second download.
+                                let mut offset = first.div_ceil(DIRECT_BLOCK) * DIRECT_BLOCK;
+                                let mut blocks = Vec::new();
+                                while offset <= last {
+                                    let end = offset.saturating_add(DIRECT_BLOCK - 1).min(total - 1);
+                                    if end > last { break; }
+                                    blocks.push((direct_cache_key(target, ByteRange { start: offset, end }, &info.tag), offset, end));
+                                    offset = end + 1;
+                                }
+                                let protected: Vec<_> = blocks.iter().map(|(key, _, _)| key.clone()).collect();
+                                for (key, offset, end) in blocks {
+                                    let data = &bytes[(offset - first) as usize..=(end - first) as usize];
+                                    crate::media_cache::put_entry(&key, mime.clone(), Some(total), data, generation, &protected);
+                                }
+                            } else if !is_direct && bounded.is_some_and(|range| range.start == first && range.end == last) && bytes.len() <= 16 * 1024 * 1024 {
+                                crate::media_cache::put_entry(&range_key(target, ByteRange { start: first, end: last }), mime.clone(), Some(total), &bytes, generation, &[]);
+                            }
+                        }
+                    }
+                    byte_response(status, mime.as_deref(), content_range.as_deref(), bytes.to_vec())
+                }
+                Err(_) => respond(502, "text/plain", b"range download failed".to_vec(), "no-store"),
+            }
+        }
+        Err(e) => respond(502, "text/plain", e.into_bytes(), "no-store"),
+    }
+}
+
+fn byte_response(status: u16, mime: Option<&str>, range: Option<&str>, bytes: Vec<u8>) -> Response<Vec<u8>> {
+    let mut response = respond(status, mime.unwrap_or("application/octet-stream"), bytes, "no-store");
+    if let Some(range) = range.and_then(|r| tauri::http::HeaderValue::from_str(r).ok()) {
+        response.headers_mut().insert("Content-Range", range);
+    }
+    response.headers_mut().insert("Access-Control-Expose-Headers", tauri::http::HeaderValue::from_static("Content-Length, Content-Type, Accept-Ranges, Content-Range"));
+    response
 }
 
 /// 统一入口：`<LOCAL_ORIGIN>/img?u=` / `hls?u=` / `seg?u=`
 ///
 /// `origin` 是本平台自定义协议的完整基址，见 [`LOCAL_ORIGIN`]；用于改写 m3u8 里的
 /// 分片与 key 地址。正常情况下调用方直接传 [`LOCAL_ORIGIN`]。
-pub async fn handle(path: &str, query: &str, origin: &str) -> Response<Vec<u8>> {
+pub async fn handle(path: &str, query: &str, origin: &str, range: Option<&str>) -> Response<Vec<u8>> {
     let target = query
         .split('&')
         .find_map(|kv| kv.strip_prefix("u="))
@@ -389,6 +705,7 @@ pub async fn handle(path: &str, query: &str, origin: &str) -> Response<Vec<u8>> 
             ),
             Err(e) => respond(502, "text/plain", e.into_bytes(), "no-store"),
         },
+        "/seg" if range.is_some() => range_response(&target, range.unwrap(), query.split('&').any(|part| part == "direct=1")).await,
         "/seg" => match load_segment(&target).await {
             Ok((ctype, bytes)) => {
                 segment_response(&target, ctype.as_deref(), bytes.as_ref().clone(), origin)
@@ -407,6 +724,137 @@ pub async fn handle(path: &str, query: &str, origin: &str) -> Response<Vec<u8>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "local HTTP integration test; run individually with loopback access"]
+    async fn range_cache_local_server() {
+        use std::io::{Read, Write};
+        let _test_guard = crate::media_cache::TEST_LOCK.lock().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for (sequence, incoming) in listener.incoming().take(8).enumerate() {
+                let mut stream = incoming.unwrap();
+                stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                let mut request = Vec::new(); let mut chunk = [0; 2048];
+                while !request.ends_with(b"\r\n\r\n") {
+                    let size = stream.read(&mut chunk).unwrap();
+                    if size == 0 { break; }
+                    request.extend_from_slice(&chunk[..size]);
+                }
+                let request = String::from_utf8(request).unwrap();
+                if request.lines().next().unwrap().contains(".aac") || request.lines().next().unwrap().contains(".vtt") {
+                    let text = request.lines().next().unwrap().contains(".vtt");
+                    let payload: &[u8] = if text { b"WEBVTT\n\n00:00.000 --> 00:04.000\nCached subtitle\n" } else { b"audio fixture" };
+                    // Exercise type inference for generic upstream content types.
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", payload.len()).unwrap();
+                    stream.write_all(payload).unwrap();
+                    continue;
+                }
+                if request.lines().next().unwrap().contains(".m3u8") {
+                    let payload = format!("#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\nseg{sequence}.ts\n#EXT-X-ENDLIST\n");
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", payload.len(), payload).unwrap();
+                    continue;
+                }
+                let header = request.lines().find_map(|line| line.split_once(':').filter(|(name, _)| name.eq_ignore_ascii_case("range")).map(|(_, value)| value.trim())).unwrap();
+                let range = parse_bounded_range(header).unwrap();
+                let bytes = b"01234567";
+                let payload = &bytes[range.start as usize..=range.end as usize];
+                write!(stream, "HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\nETag: \"v1\"\r\nContent-Range: bytes {}-{}/8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", range.start, range.end, payload.len()).unwrap();
+                stream.write_all(payload).unwrap();
+            }
+        });
+        let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("hghub-range-net-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::network_policy::bind_security(&dir);
+        crate::network_policy::set_strict_security(false).unwrap();
+        crate::media_cache::bind(&dir);
+        crate::media_cache::set_limit(128).unwrap();
+        let url = format!("http://{address}/video.mp4");
+        let (total, tag) = probe_direct(&url).await.unwrap();
+        assert_eq!(total, 8);
+        assert!(prefetch_segment(&url, Some(ByteRange { start: 0, end: 7 }), Some(&tag), &[]).await.unwrap());
+        let changing = format!("http://{address}/changing.m3u8");
+        let (_, first) = load_segment(&changing).await.unwrap();
+        let (_, second) = load_segment(&changing).await.unwrap();
+        assert_ne!(first, second, "media playlists must not be frozen in the small-object cache");
+        let root = format!("http://{address}/root.m3u8");
+        let first = load_playlist(&root, LOCAL_ORIGIN).await.unwrap();
+        let key = format!("{LOCAL_ORIGIN}|{root}");
+        PL_CACHE.lock().unwrap().get_mut(&key).unwrap().0 = std::time::Instant::now();
+        let second = load_playlist(&root, LOCAL_ORIGIN).await.unwrap();
+        assert_ne!(first, second, "an expired root playlist must be refetched");
+        let audio = format!("http://{address}/selected.aac");
+        let subtitles = format!("http://{address}/selected.vtt");
+        assert!(prefetch_segment(&audio, None, None, &[]).await.unwrap());
+        assert!(prefetch_segment(&subtitles, None, None, &[]).await.unwrap());
+        server.join().unwrap();
+        let (mime, bytes) = load_segment(&audio).await.unwrap();
+        assert_eq!(mime.as_deref(), Some("audio/aac")); assert_eq!(bytes.as_slice(), b"audio fixture");
+        let (mime, bytes) = load_segment(&subtitles).await.unwrap();
+        assert_eq!(mime.as_deref(), Some("text/vtt")); assert!(bytes.starts_with(b"WEBVTT"));
+        let response = range_response(&url, "bytes=2-4", true).await;
+        assert_eq!(response.status(), 206);
+        assert_eq!(response.headers()["Content-Range"], "bytes 2-4/8");
+        assert_eq!(response.body(), b"234");
+        crate::media_cache::clear().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_ranges_read_exact_bytes_from_cached_blocks() {
+        let _test_guard = crate::media_cache::TEST_LOCK.lock().unwrap();
+        let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("hghub-range-{}-{unique}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::media_cache::bind(&dir);
+        crate::media_cache::set_limit(128).unwrap();
+        let url = "https://example.test/movie.mp4";
+        let info = DirectInfo { total: 8, cursor: 0, etag: "\"v1\"".into(), tag: "test-v1".into() };
+        DIRECT_MEDIA.lock().unwrap().insert(url.into(), info.clone());
+        let key = direct_cache_key(url, ByteRange { start: 0, end: 7 }, &info.tag);
+        assert!(crate::media_cache::put_entry(&key, Some("video/mp4".into()), Some(8), b"01234567", crate::media_cache::generation().unwrap(), &[]));
+        let response = range_response(url, "bytes=2-4", true).await;
+        assert_eq!(response.status(), 206);
+        assert_eq!(response.headers()["Content-Range"], "bytes 2-4/8");
+        assert_eq!(response.body(), b"234");
+        let response = range_response(url, "bytes=5-", true).await;
+        assert_eq!(response.status(), 206);
+        assert_eq!(response.headers()["Content-Range"], "bytes 5-7/8");
+        assert_eq!(response.body(), b"567");
+        assert_eq!(direct_cursor(url), 5);
+        let total = DIRECT_BLOCK + 5;
+        DIRECT_MEDIA.lock().unwrap().insert(url.into(), DirectInfo { total, ..info.clone() });
+        let generation = crate::media_cache::generation().unwrap();
+        let first = direct_cache_key(url, ByteRange { start: 0, end: DIRECT_BLOCK - 1 }, &info.tag);
+        let second = direct_cache_key(url, ByteRange { start: DIRECT_BLOCK, end: total - 1 }, &info.tag);
+        assert!(crate::media_cache::put_entry(&first, Some("video/mp4".into()), Some(total), &vec![b'A'; DIRECT_BLOCK as usize], generation, &[]));
+        assert!(crate::media_cache::put_entry(&second, Some("video/mp4".into()), Some(total), b"BCDEF", generation, &[]));
+        let response = range_response(url, "bytes=1048574-1048578", true).await;
+        assert_eq!(response.status(), 206);
+        assert_eq!(response.body(), b"AABCD");
+        assert_eq!(response.headers()["Content-Range"], "bytes 1048574-1048578/1048581");
+        assert_eq!(range_response(url, "bytes=4-1", true).await.status(), 400);
+        DIRECT_MEDIA.lock().unwrap().remove(url);
+        crate::media_cache::clear().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn byte_ranges_have_distinct_keys_and_strict_content_ranges() {
+        let a = ByteRange { start: 0, end: 99 };
+        let b = ByteRange { start: 100, end: 199 };
+        assert_ne!(range_key("https://example.test/video", a), range_key("https://example.test/video", b));
+        assert_eq!(parse_content_range("bytes 0-99/200"), Some((0, 99, 200)));
+        assert!(parse_content_range("bytes 0-200/200").is_none());
+        assert!(parse_content_range("bytes 0-99/*").is_none());
+        assert!(parse_bounded_range("bytes=0-99").is_some());
+        assert!(parse_bounded_range("bytes=0-").is_none());
+        assert!(parse_bounded_range("bytes=99-0").is_none());
+        for value in ["bytes=0-", "bytes=-500", "bytes=0-9,20-29"] { assert!(valid_range_header(value)); }
+        for value in ["bytes=9-0", "bytes=-0", "bytes=--", "bytes=0-1,"] { assert!(!valid_range_header(value)); }
+    }
 
     #[test]
     fn dateranges_keep_timing_and_scte_metadata_but_drop_external_resources() {
@@ -489,7 +937,7 @@ mod tests {
             &text[..text.len().min(160)]
         );
         let q = format!("u={}", enc(&url));
-        let resp = handle("/hls", &q, LOCAL_ORIGIN).await;
+        let resp = handle("/hls", &q, LOCAL_ORIGIN, None).await;
         let body = String::from_utf8_lossy(resp.body()).to_string();
         println!("proxied status={} len={}", resp.status(), body.len());
         assert!(body.contains("#EXTM3U"));
@@ -501,7 +949,7 @@ mod tests {
             .to_string();
         println!("seg line: {}", &seg_line[..seg_line.len().min(120)]);
         let seg_q = seg_line.split("?u=").nth(1).unwrap();
-        let seg = handle("/seg", &format!("u={seg_q}"), LOCAL_ORIGIN).await;
+        let seg = handle("/seg", &format!("u={seg_q}"), LOCAL_ORIGIN, None).await;
         println!("segment status={} len={}", seg.status(), seg.body().len());
         assert_eq!(seg.status(), 200);
         assert!(seg.body().len() > 1000);

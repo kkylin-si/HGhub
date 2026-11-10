@@ -442,7 +442,7 @@ input[type="range"].hg-range::-webkit-slider-thumb { -webkit-appearance: none; w
   pointer-events: none; position: absolute; height: 2px; inset: auto 0;
   background: rgba(255,255,255,.16); border-radius: 2px; overflow: hidden; transition: height .16s;
 }
-.desktop-seek-buffer { position: absolute; height: 100%; background: rgba(255,255,255,.10); }
+.desktop-seek-buffer { position: absolute; height: 100%; background: rgba(255,255,255,.48); }
 .desktop-seek-played { position: absolute; height: 100%; background: #80bbdf; border-radius: inherit; }
 .desktop-seek:hover .desktop-seek-track, .desktop-seek:focus-within .desktop-seek-track { height: 4px; }
 .desktop-seek > input {

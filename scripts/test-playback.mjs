@@ -14,14 +14,14 @@ import { createServer as createViteServer } from "vite";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const { values: args } = parseArgs({ options: {
   "media-dir": { type: "string" }, output: { type: "string" }, "browser-executable": { type: "string" },
-  scenarios: { type: "string", default: "seek,legacy,stall,lifecycle,mms" }, help: { type: "boolean" },
+  scenarios: { type: "string", default: "seek,legacy,stall,lifecycle,mms,subtitles,subtitles-legacy,subtitles-hls" }, help: { type: "boolean" },
 } });
 if (args.help) {
-  console.log("pnpm test:playback [--media-dir DIR] [--output NEW_DIR] [--browser-executable PATH] [--scenarios seek,legacy,stall,lifecycle,mms]");
+  console.log("pnpm test:playback [--media-dir DIR] [--output NEW_DIR] [--browser-executable PATH] [--scenarios seek,legacy,stall,lifecycle,mms,subtitles,subtitles-legacy,subtitles-hls]");
   process.exit(0);
 }
 const scenarios = args.scenarios.split(",");
-assert(scenarios.length && scenarios.every(s => ["seek", "legacy", "stall", "lifecycle", "mms"].includes(s)), "Unknown scenario");
+assert(scenarios.length && scenarios.every(s => ["seek", "legacy", "stall", "lifecycle", "mms", "subtitles", "subtitles-legacy", "subtitles-hls"].includes(s)), "Unknown scenario");
 const output = resolve(args.output || join(root, "test-results", "playback", new Date().toISOString().replace(/[:.]/g, "-")));
 await mkdir(dirname(output), { recursive: true });
 await mkdir(output); // Refuse to overwrite artifacts from an earlier run.
@@ -41,15 +41,26 @@ async function serveMedia(dir) {
     res.on("close", () => jsonl(join(output, "media-server.jsonl"), { request, route: url.pathname, fragment, status, bytes, elapsed_ms: Math.round(performance.now() - started), aborted: !res.writableFinished }));
     try {
       let body, kind;
+      const target = new URL(url.searchParams.get("u") || "https://media.fixture.invalid/list.m3u8");
+      const proxied = file => `http://hg.localhost/seg?u=${encodeURIComponent(`https://media.fixture.invalid/${file}`)}`;
+      const rewritten = () => Buffer.from(manifest.split("\n").map(line => !line || line.startsWith("#") ? line : proxied(line.trim())).join("\n"));
       if (url.pathname === "/hls") {
-        body = Buffer.from(manifest.split("\n").map(line => !line || line.startsWith("#") ? line :
-          `http://hg.localhost/seg?u=${encodeURIComponent(`https://media.fixture.invalid/${line.trim()}`)}`).join("\n"));
+        body = target.pathname.endsWith("master.m3u8")
+          ? Buffer.from(`#EXTM3U\n#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="text",NAME="Chinese",LANGUAGE="zh",DEFAULT=YES,AUTOSELECT=YES,URI="${proxied('subs.m3u8')}"\n#EXT-X-STREAM-INF:BANDWIDTH=1000000,SUBTITLES="text"\n${proxied('list.m3u8')}\n`)
+          : rewritten();
         kind = "application/vnd.apple.mpegurl";
       } else if (url.pathname === "/seg") {
-        fragment = basename(new URL(url.searchParams.get("u")).pathname);
-        assert(/^seg\d+\.ts$/.test(fragment), "Unexpected fixture segment");
-        await new Promise(done => setTimeout(done, 120));
-        body = await readFile(join(dir, fragment)); kind = "video/mp2t";
+        fragment = basename(target.pathname);
+        if (fragment === "list.m3u8") { body = rewritten(); kind = "application/vnd.apple.mpegurl"; }
+        else if (fragment === "subs.m3u8") {
+          body = Buffer.from(`#EXTM3U\n#EXT-X-TARGETDURATION:90\n#EXT-X-MEDIA-SEQUENCE:0\n#EXTINF:90,\n${proxied('text.vtt')}\n#EXT-X-ENDLIST\n`); kind = "application/vnd.apple.mpegurl";
+        } else if (fragment === "text.vtt") {
+          body = Buffer.from("WEBVTT\n\n00:00:00.000 --> 00:01:30.000\nReal HLS subtitles\n"); kind = "text/vtt";
+        } else {
+          assert(/^seg\d+\.ts$/.test(fragment), "Unexpected fixture segment");
+          await new Promise(done => setTimeout(done, 120));
+          body = await readFile(join(dir, fragment)); kind = "video/mp2t";
+        }
       } else { status = 404; body = Buffer.from("not found"); kind = "text/plain"; }
       bytes = body.length;
       res.writeHead(status, { "Content-Type": kind, "Content-Length": bytes, "Access-Control-Allow-Origin": "*" });
@@ -78,6 +89,73 @@ async function loadPlayer(page, legacy = false, extra = "") {
   await page.goto(`${report.ui}/tests/player-seek.html?diagnostics=1&proxy=${encodeURIComponent(report.media)}${legacy ? "&legacy=1" : ""}${extra}`);
   await page.waitForFunction(() => document.querySelector("video")?.currentTime > 1);
 }
+async function subtitleChecks(page, legacy) {
+  await loadPlayer(page, legacy);
+  const button = page.getByRole("button", { name: "字幕", exact: true });
+  assert.equal(await button.getAttribute("aria-pressed"), "true", "Fresh preferences enable subtitles");
+  const addTrack = () => page.evaluate(() => {
+    const video = document.querySelector("video");
+    const track = video.addTextTrack("subtitles", "Fixture captions", "zh");
+    track.addCue(new VTTCue(0, 90, "Subtitle fixture"));
+    window.playerSeekFixture.caption = track;
+  });
+  const mode = expected => page.waitForFunction(expected => window.playerSeekFixture.caption?.mode === expected, expected);
+  const toggle = async () => { await page.mouse.move(650, 450); await button.click(); };
+  await addTrack(); await mode("showing");
+  await toggle(); await mode("hidden");
+  assert.equal(JSON.parse(await page.evaluate(() => localStorage.getItem("hghub_app_v1"))).subtitlesEnabled, false);
+  await page.evaluate(() => window.playerSeekFixture.nextSource());
+  await page.waitForFunction(() => document.querySelector("video")?.currentTime > 1);
+  assert.equal(await button.getAttribute("aria-pressed"), "false");
+  await addTrack();
+  await page.evaluate(() => { window.playerSeekFixture.caption.mode = "showing"; });
+  await mode("hidden");
+  await page.reload();
+  await page.waitForFunction(() => document.querySelector("video")?.currentTime > 1);
+  assert.equal(await button.getAttribute("aria-pressed"), "false", "Reload retains hidden preference");
+  await addTrack(); await toggle(); await mode("showing");
+  await page.reload();
+  await page.waitForFunction(() => document.querySelector("video")?.currentTime > 1);
+  assert.equal(await button.getAttribute("aria-pressed"), "true", "Reload retains visible preference");
+  await addTrack(); await mode("showing");
+  const native = await page.evaluate(async () => {
+    const { attachSubtitles } = await import('/src/subtitles.ts');
+    const video = document.createElement("video");
+    let enabled = false;
+    const metadata = video.addTextTrack("metadata", "Metadata"); metadata.mode = "hidden";
+    const captions = video.addTextTrack("captions", "Native captions"); captions.mode = "showing";
+    const dispose = attachSubtitles(video, null, () => enabled);
+    const hidden = captions.mode === "hidden";
+    enabled = true; video.dispatchEvent(new Event("subtitle-preference"));
+    const shown = captions.mode === "showing";
+    const metadataPreserved = metadata.mode === "hidden";
+    dispose();
+    return { hidden, shown, metadataPreserved };
+  });
+  assert.deepEqual(native, { hidden: true, shown: true, metadataPreserved: true });
+  return { persistence: true, new_source: true, late_tracks: true, native };
+}
+
+async function hlsSubtitleChecks(page) {
+  await loadPlayer(page, false, "&subtitle_hls=1");
+  const showing = () => page.waitForFunction(() => Array.from(document.querySelector("video").textTracks).some(track => track.mode === "showing" && Array.from(track.activeCues || []).some(cue => cue.text.includes("Real HLS subtitles"))));
+  await showing();
+  const toggle = async () => { await page.mouse.move(650, 450); await page.getByRole("button", { name: "字幕", exact: true }).click(); };
+  await toggle();
+  await page.waitForFunction(() => window.playerSeekFixture.engineState().subtitleTrack === -1 && !window.playerSeekFixture.engineState().subtitleDisplay);
+  await clickProgress(page, .6);
+  await page.waitForFunction(() => document.querySelector("video").currentTime > 50 && !document.querySelector("video").seeking);
+  await toggle(); await showing();
+  assert((await page.evaluate(() => document.querySelector("video").currentTime)) > 50, "Enabling subtitles must preserve playback position");
+  await toggle(); await page.reload();
+  await page.waitForFunction(() => document.querySelector("video")?.currentTime > 1);
+  await page.waitForFunction(() => window.playerSeekFixture.engineState().subtitleCount === 1);
+  assert.equal(await page.getByRole("button", { name: "字幕", exact: true }).getAttribute("aria-pressed"), "false");
+  assert.equal(await page.evaluate(() => window.playerSeekFixture.engineState().subtitleTrack), -1);
+  await toggle(); await showing();
+  return { hls_vtt: true, mid_playback_enable: true, persisted_off: true, playback_position_preserved: true };
+}
+
 async function seekChecks(page, legacy) {
   await loadPlayer(page, legacy);
   await clickProgress(page, .1);
@@ -312,7 +390,7 @@ try {
     const result = { name, status: "running", started: new Date().toISOString() }; report.cases.push(result);
     let deadline;
     try {
-      const action = name === "seek" || name === "legacy" ? seekChecks(page, name === "legacy") : name === "stall" ? stallCheck(page) : name === "mms" ? managedMediaCheck(page) : lifecycleCheck(page);
+      const action = name === "subtitles-hls" ? hlsSubtitleChecks(page) : name.startsWith("subtitles") ? subtitleChecks(page, name === "subtitles-legacy") : name === "seek" || name === "legacy" ? seekChecks(page, name === "legacy") : name === "stall" ? stallCheck(page) : name === "mms" ? managedMediaCheck(page) : lifecycleCheck(page);
       result.metrics = await Promise.race([action, new Promise((_, reject) => { deadline = setTimeout(() => reject(new Error("Scenario exceeded 45 seconds")), 45000); })]);
       assert.deepEqual(pageErrors, [], "Browser script errors");
       assert.deepEqual(externalRequests, [], "Unexpected external network requests");

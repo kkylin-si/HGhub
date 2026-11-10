@@ -23,18 +23,22 @@ XMLHttpRequest.prototype.open = function (this: XMLHttpRequest, method: string, 
 const fixture = {
   seeks: [] as number[], errors: [] as string[],
   setActive: (_active: boolean) => {},
+  nextSource: () => {},
+  sourceKey: 0,
   logs: [] as { event: string; data: Record<string, unknown> }[],
   setLogging: setPlaybackLog,
   flushLogs: flushPlaybackLog,
   rejectLoggingSave: false,
   pauseBuffering: () => testHls?.pauseBuffering(),
   resumeBuffering: () => testHls?.resumeBuffering(),
-  engineState: () => ({ loading: testHls?.loadingEnabled, buffering: testHls?.bufferingEnabled, levels: testHls?.levels.length }),
+  engineState: () => ({ loading: testHls?.loadingEnabled, buffering: testHls?.bufferingEnabled, levels: testHls?.levels.length, subtitleTrack: testHls?.subtitleTrack, subtitleCount: testHls?.subtitleTracks.length, subtitleDisplay: testHls?.subtitleDisplay }),
 };
 let testHls: Hls | undefined;
 const diagnosticTest = new URLSearchParams(location.search).has("diagnostics");
 const legacyTest = new URLSearchParams(location.search).has("legacy");
 const initiallyInactive = new URLSearchParams(location.search).has("inactive");
+const subtitleHls = new URLSearchParams(location.search).has("subtitle_hls");
+const mediaSource = () => `https://media.fixture.invalid/${subtitleHls ? "master" : "list"}.m3u8${fixture.sourceKey ? `?source=${fixture.sourceKey}` : ""}`;
 if (diagnosticTest) {
   // Test-only handle: exercise the real engine's public API without rewriting production modules.
   const attach = Hls.prototype.attachMedia;
@@ -60,8 +64,9 @@ document.addEventListener("seeking", (e) => {
   if (e.target instanceof HTMLVideoElement) fixture.seeks.push(e.target.currentTime);
 }, true);
 window.addEventListener("error", (e) => fixture.errors.push(e.message));
+api.playbackCacheStatus = async () => ({ max_mib: 0, bytes: 0, revision: 0 });
 api.boot = async () => ({ user: null, logged_in: false, base: "https://fixture.invalid", strict_security: true });
-api.play = async () => ({ id: 991, ep_num: 1, title: "Seek fixture", duration: 90, video_url: "https://media.fixture.invalid/list.m3u8" });
+api.play = async () => ({ id: 991, ep_num: 1, title: "Seek fixture", duration: 90, video_url: mediaSource() });
 api.video = async () => ({
   id: 991, title: "Seek fixture", description: "", cover: "", tags: [], score: 0,
   episode_count: 1, total_episodes: 1,
@@ -72,12 +77,15 @@ api.video = async () => ({
 function Fixture() {
   const [active, setActive] = useState(!initiallyInactive);
   const [settings, setSettings] = useState(false);
+  const [sourceKey, setSourceKey] = useState(0);
+  fixture.sourceKey = sourceKey;
+  fixture.nextSource = () => setSourceKey(key => key + 1);
   fixture.setActive = setActive;
   return <AppProvider>
     <div style={{ position: "relative", width: 900, height: 540 }}>
       {legacyTest
-        ? <Player src="https://media.fixture.invalid/list.m3u8" autoPlay active={active} className="w-full h-full" diagnosticContext={{ video_id: 991, active }} />
-        : <Feed videoIds={[991]} mode="home" active={active} bottomInset={0} />}
+        ? <Player key={sourceKey} src={mediaSource()} autoPlay active={active} className="w-full h-full" diagnosticContext={{ video_id: 991, active }} />
+        : <Feed key={sourceKey} videoIds={[991]} mode="home" active={active} bottomInset={0} />}
     </div>
     <button onClick={() => setActive((v) => !v)}>切换播放页激活状态</button>
     {diagnosticTest && <button onClick={() => setSettings(v => !v)}>诊断设置</button>}

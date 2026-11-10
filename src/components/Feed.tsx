@@ -6,12 +6,13 @@ import { useStore } from "../store";
 import { Avatar, Img, Sheet } from "./ui";
 import VideoSurface, { type VideoHandle } from "./VideoSurface";
 import PlayerControls from "./PlayerControls";
+import type { CacheRange } from "../playbackCache";
 import PlaybackLock from "./PlaybackLock";
 import { ArticlePanel, CommentsPanel, EpisodesPanel } from "./Panels";
 import { setBackHandler } from "../back";
 import {
   IBack, IBoltF, IChevR, IChevronDown, IChevronUp, IClose, ICommentF, ICompress, IExpand, IFileText, IHeart, IHeartF,
-  ILink, IList, ILockF, IPauseF, IPlayF, ISearch, IStar, IStarF, IVol, IVolMute,
+  ILink, IList, ILockF, ISubtitles, IPauseF, IPlayF, ISearch, IStar, IStarF, IVol, IVolMute,
 } from "../icons";
 
 type Props = {
@@ -31,7 +32,7 @@ type Props = {
 
 export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind = "video", active, bottomInset, onBack, onNearEnd, startEp, startTime }: Props) {
   const store = useStore();
-  const { isLiked, isFav, toggleLikeLocal, toggleFavLocal, toggleFollowLocal, muted, setMuted, volume, setVolume, toast, addHistory, user, setLoginOpen } = store;
+  const { isLiked, isFav, toggleLikeLocal, toggleFavLocal, toggleFollowLocal, muted, setMuted, subtitlesEnabled, setSubtitlesEnabled, volume, setVolume, toast, addHistory, user, setLoginOpen } = store;
   const isDesktop = !isMobile;
 
   const boxRef = useRef<HTMLDivElement>(null);
@@ -46,7 +47,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   const [time, setTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [vsize, setVsize] = useState({ w: 0, h: 0 });
-  const [buffered, setBuffered] = useState(0);
+  const [cachedRanges, setCachedRanges] = useState<CacheRange[]>([]);
   const [paused, setPaused] = useState(false);
   const [controlsLocked, setControlsLocked] = useState(false);
   const [rate, setRate] = useState(1);
@@ -379,7 +380,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
 
   /* 切换条目/集数时重置播放与缩放状态 */
   useEffect(() => {
-    setTime(0); setDuration(0); setBuffered(0); setErr(""); setWaiting(true); setPaused(false); setDescOpen(false);
+    setTime(0); setDuration(0); setCachedRanges([]); setErr(""); setWaiting(true); setPaused(false); setDescOpen(false);
     setVsize({ w: 0, h: 0 });
     setPortraitFit("contain");
     setZoom({ scale: 1, x: 0, y: 0, gesturing: false });
@@ -822,6 +823,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                       active={active}
                       diagnosticContext={{ active, view: mode, kind, video_id: curId, episode: curEp }}
                       muted={muted}
+                      subtitlesEnabled={subtitlesEnabled}
                       volume={volume}
                       rate={effRate}
                       fit={effectiveFit}
@@ -831,6 +833,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                       isGesturing={zoom.gesturing}
                       onClick={() => { if (isDesktop) videoRef.current?.toggle(); }}
                       onTime={onTimeTick}
+                      onCacheRanges={setCachedRanges}
                       onDuration={onDurationTick}
                       onSize={(w, h) => setVsize({ w, h })}
                       onPlaying={() => { setPaused(false); setWaiting(false); setErr(""); }}
@@ -926,7 +929,8 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                           onPointerDown={onBarDown} onPointerMove={onBarMove} onPointerUp={onBarUp} onPointerCancel={onBarUp}>
                           <div className={`absolute inset-x-0 bottom-[10px] rounded-full transition-all ${barPct !== null ? "h-[5px]" : "h-[3px]"}`}
                             style={{ background: "rgba(255,255,255,.3)" }}>
-                            <div className="h-full rounded-full bg-white" style={{ width: `${barProgress * 100}%` }} />
+                            {duration > 0 && cachedRanges.map((range, i) => <span key={i} className="absolute h-full" style={{ left: `${Math.max(0, range.start / duration) * 100}%`, width: `${Math.max(0, Math.min(duration, range.end) - Math.max(0, range.start)) / duration * 100}%`, background: "rgba(255,255,255,.48)" }} />)}
+                          <div className="relative h-full rounded-full bg-white" style={{ width: `${barProgress * 100}%` }} />
                           </div>
                           {barPct !== null && (
                             <div className="absolute left-1/2 -translate-x-1/2 -top-8 px-2.5 py-1 rounded-md hg-chip-strong backdrop-blur-md text-[12px] font-bold tabular-nums whitespace-nowrap">
@@ -952,6 +956,8 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                           className={`ml-auto shrink-0 flex items-center gap-1 px-2.5 h-8 rounded-full text-[12px] font-bold pressable ${effRate !== 1 ? "bg-primary text-on-primary" : "hg-chip hg-ink-2"}`}>
                           <IBoltF size={12} />{effRate}x
                         </button>
+                        <button aria-label="字幕" aria-pressed={subtitlesEnabled} title={subtitlesEnabled ? "关闭字幕" : "显示字幕"}
+                          onClick={() => setSubtitlesEnabled(!subtitlesEnabled)} className={`shrink-0 h-8 w-8 rounded-full flex items-center justify-center pressable ${subtitlesEnabled ? "bg-primary text-on-primary" : "hg-chip hg-ink-2"}`}><ISubtitles size={20} /></button>
                         <span className="shrink-0 text-[11.5px] hg-ink-4 tabular-nums">{fmtTime(duration)}</span>
                       </div>
                     </>
@@ -1169,7 +1175,8 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                         onPointerDown={onBarDown} onPointerMove={onBarMove} onPointerUp={onBarUp} onPointerCancel={onBarUp}>
                         <div className={`absolute inset-x-0 top-1/2 -translate-y-1/2 rounded-full transition-all ${barPct !== null ? "h-[5px]" : "h-[2.5px]"}`}
                           style={{ background: "rgba(255,255,255,.3)" }}>
-                          <div className="h-full rounded-full bg-white"
+                          {duration > 0 && cachedRanges.map((range, i) => <span key={i} className="absolute h-full" style={{ left: `${Math.max(0, range.start / duration) * 100}%`, width: `${Math.max(0, Math.min(duration, range.end) - Math.max(0, range.start)) / duration * 100}%`, background: "rgba(255,255,255,.48)" }} />)}
+                          <div className="relative h-full rounded-full bg-white"
                             style={{ width: `${barProgress * 100}%`, transition: barPct !== null ? "none" : "width .25s linear" }} />
                         </div>
                         {barPct !== null && (
@@ -1190,8 +1197,8 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
       {/* 桌面控制条 */}
       {isDesktop && (
         <PlayerControls
-          paused={paused} time={time} duration={duration} buffered={buffered} rate={rate}
-          muted={muted} volume={volume} theater={theater} fullscreen={fullscreen}
+          paused={paused} time={time} duration={duration} cachedRanges={cachedRanges} rate={rate}
+          muted={muted} subtitlesEnabled={subtitlesEnabled} onSubtitles={() => setSubtitlesEnabled(!subtitlesEnabled)} volume={volume} theater={theater} fullscreen={fullscreen}
           visible={active && !idle}
           seekEnabled={active && !controlsLocked}
           seekKey={playKey}

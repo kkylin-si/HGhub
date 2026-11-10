@@ -1,6 +1,8 @@
 import React, { useEffect, useImperativeHandle, useRef, forwardRef, useState } from "react";
 import Hls from "hls.js";
-import { isLocalMedia, platform, playlist } from "../api";
+import { attachSubtitles } from "../subtitles";
+import { attachPlaybackCache, attachDirectCache, type CacheRange } from "../playbackCache";
+import { isLocalMedia, platform, mediaUrl } from "../api";
 import { mediaResource, observeHls, usePlayerDiagnostics } from "../playbackDiagnostics";
 import { usePlaybackActivity } from "../usePlaybackActivity";
 
@@ -24,6 +26,7 @@ type Props = {
   active?: boolean;
   diagnosticContext?: Record<string, unknown>;
   muted?: boolean;
+  subtitlesEnabled?: boolean;
   loop?: boolean;
   fit?: "contain" | "cover";
   /** 缩放倍率与平移偏移（用于移动端竖屏下双指缩放横屏视频） */
@@ -35,6 +38,7 @@ type Props = {
   volume?: number;
   rate?: number;
   onTime?: (t: number) => void;
+  onCacheRanges?: (ranges: CacheRange[]) => void;
   onDuration?: (d: number) => void;
   onSize?: (w: number, h: number) => void;
   onPlaying?: () => void;
@@ -48,14 +52,15 @@ type Props = {
 
 /** 只负责「播」：hls.js + video 元素，控制条由外层渲染。 */
 const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
-  { src, poster, autoPlay = true, active = true, diagnosticContext = {}, muted = false, loop = false, fit = "contain",
+  { src, poster, autoPlay = true, active = true, diagnosticContext = {}, muted = false, subtitlesEnabled = true, loop = false, fit = "contain",
     scale = 1, panX = 0, panY = 0, isGesturing = false,
     volume = 1, rate = 1,
-    onTime, onDuration, onSize, onPlaying, onPause, onWaiting, onEnded, onError, onClick, className = "" },
+    onTime, onCacheRanges, onDuration, onSize, onPlaying, onPause, onWaiting, onEnded, onError, onClick, className = "" },
   ref,
 ) {
   const videoRef = useRef<HTMLVideoElement>(null);
   const hlsRef = useRef<Hls | null>(null);
+  const subtitlesRef = useRef(subtitlesEnabled); subtitlesRef.current = subtitlesEnabled;
   const recoverCountRef = useRef(0);
   const recoverTimerRef = useRef<number | null>(null);
   const lastSizeRef = useRef({ w: 0, h: 0 });
@@ -85,7 +90,7 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
 
     requestSeek(target, source);
     onWaiting?.();
-    if (hlsRef.current) {
+    if (hlsRef.current?.bufferingEnabled) {
       try {
         hlsRef.current.startLoad(target);
       } catch { /* ignore */ }
@@ -165,7 +170,7 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
     if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null; }
 
     const proxied = isLocalMedia(src);
-    const url = proxied ? src : playlist(src);
+    const url = proxied ? src : mediaUrl(src);
     const useHls = !url.includes("/seg?u=");
     const isIos = platform === "ios";
     trace("source.load", { engine: useHls && Hls.isSupported() ? "hls.js" : "native", auto_play: autoPlay, resource: mediaResource(src) });
@@ -180,6 +185,8 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
     };
     applySettings();
 
+    let detachCache: (() => void) | undefined;
+    let detachSubtitles: (() => void) | undefined;
     if (useHls && Hls.isSupported()) {
       const hls = new Hls({
         // 禁用从插播/内容引导 JSON 派生直连 URL 的可选功能。
@@ -209,6 +216,8 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
         startFragPrefetch: true,
       });
       hlsRef.current = hls;
+      detachSubtitles = attachSubtitles(video, hls, () => subtitlesRef.current);
+      detachCache = attachPlaybackCache(hls, video, activity.isActive, (ranges) => onCacheRanges?.(ranges), undefined, () => subtitlesRef.current);
       observeHls(hls, trace);
       hls.loadSource(url);
       hls.attachMedia(video);
@@ -275,6 +284,9 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
         }
       });
     } else {
+      detachSubtitles = attachSubtitles(video, null, () => subtitlesRef.current);
+      if (useHls) detachCache = attachPlaybackCache(null, video, activity.isActive, (ranges) => onCacheRanges?.(ranges), url, () => subtitlesRef.current);
+      else detachCache = attachDirectCache(url, video, activity.isActive, (ranges) => onCacheRanges?.(ranges));
       video.src = url;
       if (autoPlay) activity.play("native_autoplay", true);
     }
@@ -285,11 +297,14 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
         window.clearTimeout(recoverTimerRef.current);
         recoverTimerRef.current = null;
       }
+      detachCache?.();
+      detachSubtitles?.();
       if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null; }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [src]);
 
+  useEffect(() => { videoRef.current?.dispatchEvent(new Event("subtitle-preference")); }, [subtitlesEnabled]);
   useEffect(() => { if (videoRef.current) videoRef.current.muted = muted; }, [muted]);
   useEffect(() => { if (videoRef.current) videoRef.current.volume = volume; }, [volume]);
   useEffect(() => { if (videoRef.current) videoRef.current.playbackRate = rate; }, [rate]);

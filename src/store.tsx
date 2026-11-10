@@ -50,6 +50,7 @@ type Persist = {
   follows: number[];
   muted: boolean;
   muteOnStartup: boolean;
+  subtitlesEnabled: boolean;
   volume: number;
   searchHist: string[];
 };
@@ -57,7 +58,7 @@ type Persist = {
 const LS = "hghub_app_v1";
 const DEFAULTS: Persist = {
   likes: [], favs: [], history: [], follows: [],
-  muted: true, muteOnStartup: true, volume: 0.7, searchHist: [],
+  muted: true, muteOnStartup: true, subtitlesEnabled: true, volume: 0.7, searchHist: [],
 };
 
 /** 旧版本 history 是 number[]，读出来时升级成带进度的结构 */
@@ -84,7 +85,7 @@ function loadPersist(): Persist {
     const p = { ...DEFAULTS, ...(JSON.parse(raw) as Partial<Persist>) };
     // 只在启动时应用；本次使用中取消静音不会关闭此偏好。
     const muteOnStartup = p.muteOnStartup !== false;
-    return { ...p, muteOnStartup, muted: muteOnStartup || p.muted === true, history: normalizeHistory(p.history) };
+    return { ...p, subtitlesEnabled: p.subtitlesEnabled !== false, muteOnStartup, muted: muteOnStartup || p.muted === true, history: normalizeHistory(p.history) };
   } catch {
     return DEFAULTS;
   }
@@ -125,6 +126,7 @@ type Store = {
   clean: boolean; setClean: (v: boolean | ((p: boolean) => boolean)) => void;
   muted: boolean; setMuted: (v: boolean | ((p: boolean) => boolean)) => void;
   muteOnStartup: boolean; setMuteOnStartup: (on: boolean) => void;
+  subtitlesEnabled: boolean; setSubtitlesEnabled: (on: boolean) => void;
   volume: number; setVolume: (v: number) => void;
   searchHist: string[]; addSearch: (q: string) => void; clearSearchHist: () => void;
   strictSecurity: boolean; strictSecurityReady: boolean; securityPending: boolean; cliRelaxed: boolean; setStrictSecurity: (on: boolean) => Promise<void>;
@@ -281,6 +283,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const setMuteOnStartup = useCallback((on: boolean) => {
     setP((s) => ({ ...s, muteOnStartup: on }));
   }, []);
+  const setSubtitlesEnabled = useCallback((on: boolean) => {
+    setP((s) => ({ ...s, subtitlesEnabled: on }));
+  }, []);
   const setVolume = useCallback((v: number) => {
     const volume = Math.max(0, Math.min(1, v));
     setP((s) => ({ ...s, volume, muted: volume === 0 }));
@@ -298,12 +303,13 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     muted: p.muted, setMuted, volume: p.volume, setVolume,
     theater, setTheater, fs, setFs, clean, setClean,
     muteOnStartup: p.muteOnStartup, setMuteOnStartup,
+    subtitlesEnabled: p.subtitlesEnabled, setSubtitlesEnabled,
     searchHist: p.searchHist, addSearch, clearSearchHist,
     strictSecurity, strictSecurityReady, securityPending, cliRelaxed, setStrictSecurity,
     toasts, toast,
   }), [theme, tab, setTab, stack, push, pop, user, loginOpen, logout,
     p, toggleLikeLocal, toggleFavLocal, toggleFollowLocal, addHistory, clearHistory,
-    setMuted, setMuteOnStartup, setVolume, addSearch, clearSearchHist, strictSecurity, strictSecurityReady, securityPending, cliRelaxed, setStrictSecurity,
+    setMuted, setMuteOnStartup, setSubtitlesEnabled, setVolume, addSearch, clearSearchHist, strictSecurity, strictSecurityReady, securityPending, cliRelaxed, setStrictSecurity,
     toasts, toast, theater, setTheater, fs, setFs, clean, setClean]);
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;

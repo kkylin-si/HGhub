@@ -41,6 +41,7 @@ base64 = "0.22"
 percent-encoding = "2"
 once_cell = "1"
 ipnet = "2"
+sha2 = "0.10"
 url = "2"
 
 # macOS 红绿灯垂直居中需要读取 AppKit 按钮尺寸（见 src/macos_titlebar.rs）。
