@@ -5,6 +5,7 @@ mod logging;
 mod macos_titlebar;
 mod media;
 mod media_cache;
+mod media_download;
 mod net;
 mod network_policy;
 mod playback_log;
@@ -166,6 +167,8 @@ pub fn run() {
             api::playback_cache_observed,
             api::playback_cache_probe,
             api::playback_cache_cursor,
+            api::playback_cache_pending,
+            api::playback_cache_ready,
             api::playback_cache_start,
             api::playback_cache_stop,
             api::playback_cache_contains,

@@ -49,6 +49,23 @@ function bufferRanges(video: HTMLVideoElement): CacheRange[] {
   for (let i = 0; i < video.buffered.length; i++) result.push({ start: video.buffered.start(i), end: video.buffered.end(i) });
   return result;
 }
+const bufferingEvents = ["playing", "waiting", "timeupdate", "pause", "ratechange"];
+function canPrefetch(video: HTMLVideoElement, reserve = 5) {
+  const end = bufferRanges(video).find(range => range.start <= video.currentTime && range.end > video.currentTime)?.end ?? video.currentTime;
+  return !video.seeking && (video.paused || end - video.currentTime >= reserve * video.playbackRate);
+}
+type CacheSession = { id: string; ready: Promise<void>; buffered?: boolean };
+function startCacheSession(): CacheSession {
+  const id = `${Date.now()}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
+  return { id, ready: api.playbackCacheStart(id) };
+}
+function syncSession(session: CacheSession | undefined, video: HTMLVideoElement) {
+  const buffered = canPrefetch(video);
+  if (!session || session.buffered === buffered) return;
+  session.buffered = buffered;
+  session.ready = session.ready.then(() => api.playbackCacheReady(session.id, buffered));
+  void session.ready.catch(() => { session.buffered = undefined; });
+}
 function intersection(a: CacheRange[], b: CacheRange[]) {
   return a.flatMap(left => b.flatMap(right => {
     const start = Math.max(left.start, right.start), end = Math.min(left.end, right.end);
@@ -64,7 +81,8 @@ const sameRendition = (selected: Rendition | null, loaded: { id: number; groupId
 
 /** One serial VOD queue for video and selected audio/subtitles, including their dependencies. */
 export function attachPlaybackCache(hls: Hls | null, video: HTMLVideoElement, isActive: () => boolean, report: (ranges: CacheRange[]) => void, nativePlaylist?: string, subtitlesEnabled: () => boolean = () => true) {
-  let stopped = false, version = 0, running = false, blockedUntil = -1, revision = -1, enabled = false;
+  let stopped = false, version = 0, running = false, revision = -1, enabled = false;
+  let blocked: { key: string; bytes: number; protectedKeys: string[] } | undefined;
   let timer: number | undefined;
   let diskRanges: CacheRange[] = [];
   const tracks: Record<string, Segment[]> = { main: [], audio: [], subtitle: [] };
@@ -74,20 +92,27 @@ export function attachPlaybackCache(hls: Hls | null, video: HTMLVideoElement, is
   const nativeSelected: Record<string, string | null> = { main: null, audio: null, subtitle: null };
   const failures = new Map<string, { count: number; retryAt: number }>();
   let restartNative: (() => void) | undefined;
-  let session: { id: string; ready: Promise<void> } | undefined;
+  let session: CacheSession | undefined;
   const stopSession = () => {
     const old = session; session = undefined;
-    if (old) void old.ready.then(() => api.playbackCacheStop(old.id)).catch(() => {});
+    if (old) void old.ready.catch(() => {}).then(() => api.playbackCacheStop(old.id)).catch(() => {});
   };
   const emit = () => { if (!stopped) report(enabled ? mergeCacheRanges([...diskRanges, ...bufferRanges(video)]) : []); };
   const wake = (delay = 250) => { if (timer !== undefined) clearTimeout(timer); if (!stopped) timer = window.setTimeout(() => { void run(); }, delay); };
-  const reset = () => { version++; stopSession(); blockedUntil = -1; failures.clear(); diskRanges = []; emit(); wake(); restartNative?.(); };
+  const reset = (seeking = false) => {
+    version++;
+    stopSession();
+    blocked = undefined;
+    failures.clear();
+    if (!seeking) diskRanges = [];
+    emit();
+    wake(seeking ? 0 : 250);
+    restartNative?.();
+  };
   const activity = () => { if (!isActive()) { version++; stopSession(); } else reset(); };
   const getSession = () => {
-    if (!session) {
-      const id = `${Date.now()}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
-      session = { id, ready: api.playbackCacheStart(id) };
-    }
+    session ??= startCacheSession();
+    syncSession(session, video);
     return session;
   };
   const run = async () => {
@@ -101,7 +126,9 @@ export function attachPlaybackCache(hls: Hls | null, video: HTMLVideoElement, is
       if (revision !== status.revision) { revision = status.revision; enabled = !!status.max_mib; reset(); current = version; }
       if (!status.max_mib) { enabled = false; stopSession(); diskRanges = []; emit(); return; }
       enabled = true;
-      const snapshot = [...tracks.main, ...tracks.audio, ...(subtitlesEnabled() ? tracks.subtitle : [])].sort((a, b) => a.start - b.start);
+      const media = [...tracks.main, ...tracks.audio];
+      const subtitles = subtitlesEnabled() ? tracks.subtitle : [];
+      const snapshot = [...media, ...subtitles];
       if (!snapshot.length) { emit(); return; }
       const unique = new Map(snapshot.flatMap(resources).map(resource => [cacheKey(resource), resource]));
       const keys = [...unique.keys()];
@@ -113,19 +140,35 @@ export function attachPlaybackCache(hls: Hls | null, video: HTMLVideoElement, is
       diskRanges = audioRequired ? intersection(main, mergeCacheRanges(tracks.audio.filter(complete))) : main;
       if (subtitlesEnabled() && subtitleRequired) diskRanges = intersection(diskRanges, mergeCacheRanges(tracks.subtitle.filter(complete)));
       emit();
-      const upcoming = snapshot.filter(segment => segment.end > video.currentTime);
-      const candidates = new Map(upcoming.flatMap(resources).map(resource => [cacheKey(resource), resource]));
+      syncSession(session, video);
+      if (!canPrefetch(video)) return;
+      const time = video.currentTime;
+      const bufferedEnd = bufferRanges(video).find(range => range.start <= time && range.end > time)?.end ?? time;
+      const upcoming = [...media.filter(segment => segment.end > bufferedEnd), ...subtitles.filter(segment => segment.end > time)]
+        .sort((a, b) => a.start - b.start);
+      const candidates = new Map<string, { resource: Resource; start: number }>();
+      for (const segment of upcoming) {
+        for (const resource of resources(segment)) {
+          const key = cacheKey(resource);
+          if (!candidates.has(key)) candidates.set(key, { resource, start: segment.start });
+        }
+      }
       const next = [...candidates].find(([key]) => !available.has(key) && (failures.get(key)?.count ?? 0) < 3 && (failures.get(key)?.retryAt ?? 0) <= Date.now());
-      if (!next || video.currentTime < blockedUntil) return;
-      const [key, resource] = next;
+      if (!next) return;
+      const [key, { resource, start }] = next;
+      // Fill the first gap before protecting cached fragments farther ahead.
+      const protectedKeys = new Set([...candidates].filter(([, candidate]) => candidate.start <= start).map(([key]) => key));
+      if (blocked?.key === key && status.bytes >= blocked.bytes
+        && blocked.protectedKeys.every(key => protectedKeys.has(key) && available.has(key))) return;
       const currentSession = getSession();
       await currentSession.ready;
       if (stopped || current !== version || !isActive() || session !== currentSession) return;
       try {
-        const saved = await api.playbackCachePrefetch(resource.url, [...candidates.keys()], currentSession.id, resource.range);
+        const saved = await api.playbackCachePrefetch(resource.url, [...protectedKeys], currentSession.id, resource.range);
         if (stopped || current !== version || !isActive()) return;
-        if (saved) { failures.delete(key); delay = 0; }
-        else blockedUntil = upcoming[0]?.end ?? Infinity;
+        if (saved) { blocked = undefined; failures.delete(key); }
+        else blocked = { key, bytes: status.bytes, protectedKeys: [...protectedKeys].filter(key => available.has(key)) };
+        delay = 0; // Recheck protection in case playback buffered more while the download was in flight.
       } catch {
         if (current !== version || stopped) return;
         const count = (failures.get(key)?.count ?? 0) + 1;
@@ -262,17 +305,24 @@ export function attachPlaybackCache(hls: Hls | null, video: HTMLVideoElement, is
   };
   if (!hls && nativePlaylist) restartNative = () => { void loadNative(); };
   const onCacheChange = () => { enabled = false; reset(); };
-  video.addEventListener("seeking", reset);
+  const seeking = () => reset(true);
+  const buffering = () => { syncSession(session, video); if (!running && canPrefetch(video)) wake(0); };
+  const progress = () => { emit(); buffering(); };
+  hls?.on(Hls.Events.FRAG_BUFFERED, progress);
+  video.addEventListener("seeking", seeking);
   video.addEventListener("subtitle-preference", subtitlePreference);
-  video.addEventListener("progress", emit);
+  video.addEventListener("progress", progress);
   video.addEventListener("playback-activity", activity);
+  for (const event of bufferingEvents) video.addEventListener(event, buffering);
   window.addEventListener("playback-cache-change", onCacheChange);
   wake();
   return () => {
     stopped = true; version++; stopSession(); if (timer !== undefined) clearTimeout(timer); abort.abort();
     hls?.off(Hls.Events.LEVEL_LOADED, levelLoaded); hls?.off(Hls.Events.AUDIO_TRACK_SWITCHING, audioSwitching); hls?.off(Hls.Events.AUDIO_TRACK_LOADED, audioLoaded);
     hls?.off(Hls.Events.SUBTITLE_TRACK_SWITCH, subtitleSwitching); hls?.off(Hls.Events.SUBTITLE_TRACK_LOADED, subtitleLoaded);
-    video.removeEventListener("seeking", reset); video.removeEventListener("subtitle-preference", subtitlePreference); video.removeEventListener("progress", emit); video.removeEventListener("playback-activity", activity);
+    hls?.off(Hls.Events.FRAG_BUFFERED, progress);
+    video.removeEventListener("seeking", seeking); video.removeEventListener("subtitle-preference", subtitlePreference); video.removeEventListener("progress", progress); video.removeEventListener("playback-activity", activity);
+    for (const event of bufferingEvents) video.removeEventListener(event, buffering);
     window.removeEventListener("playback-cache-change", onCacheChange); report([]);
   };
 }
@@ -283,11 +333,13 @@ export function attachDirectCache(proxyUrl: string, video: HTMLVideoElement, isA
   try { url = new URL(proxyUrl).searchParams.get("u") || ""; } catch { /* invalid source */ }
   let stopped = false, running = false, total = 0, offset = 0, version = 0, validator = "", blockedCursor = -1, lastLimit = -1, revision = -1, lastCursor = -1, failures = 0, enabled = false;
   let timer: number | undefined;
-  let session: { id: string; ready: Promise<void> } | undefined;
+  let session: CacheSession | undefined;
+  let filling = false;
+  const fillFailures = new Map<number, { count: number; retryAt: number }>();
   const block = 1024 * 1024;
   const stopSession = () => {
     const old = session; session = undefined;
-    if (old) void old.ready.then(() => api.playbackCacheStop(old.id)).catch(() => {});
+    if (old) void old.ready.catch(() => {}).then(() => api.playbackCacheStop(old.id)).catch(() => {});
   };
   const emit = () => { if (!stopped) report(enabled ? mergeCacheRanges(bufferRanges(video)) : []); };
   const wake = (delay = 250) => { if (timer !== undefined) clearTimeout(timer); timer = window.setTimeout(() => { void run(); }, delay); };
@@ -303,6 +355,8 @@ export function attachDirectCache(proxyUrl: string, video: HTMLVideoElement, isA
       const { max_mib } = status;
       if (!max_mib) { enabled = false; stopSession(); emit(); return; }
       enabled = true;
+      syncSession(session, video);
+      if (!canPrefetch(video)) return;
       if (lastLimit !== max_mib) { lastLimit = max_mib; blockedCursor = -1; }
       if (failures >= 3) return;
       if (!total) {
@@ -310,14 +364,16 @@ export function attachDirectCache(proxyUrl: string, video: HTMLVideoElement, isA
         await currentSession.ready;
         if (stopped || current !== version || !isActive()) return;
         const info = await api.playbackCacheProbe(url, currentSession.id);
+        if (stopped || current !== version || !isActive()) return;
         total = info.total; validator = info.tag;
         if (!Number.isSafeInteger(total) || total <= 0) { total = 0; return; }
       }
       const cursor = await api.playbackCacheCursor(url);
       if (stopped || current !== version || !isActive()) return;
+      void fill(current, cursor);
       const start = Math.floor(cursor / block) * block;
-      if (start !== lastCursor) { lastCursor = start; offset = start; failures = 0; }
-      if (start === blockedCursor || failures >= 3 || offset >= total) return;
+      if (start !== lastCursor) { lastCursor = start; offset = start; failures = 0; blockedCursor = -1; }
+      if (start === blockedCursor || failures >= 3 || cursor >= total || offset >= total) return;
       if (offset < start) offset = start;
       const list: Segment[] = [];
       for (let i = offset; i < total && list.length < 64; i += block) {
@@ -333,10 +389,10 @@ export function attachDirectCache(proxyUrl: string, video: HTMLVideoElement, isA
       await currentSession.ready;
       if (stopped || current !== version || !isActive() || session !== currentSession) return;
       const protectedKeys: string[] = [];
-      for (let i = start; i < total && protectedKeys.length < 4096; i += block) {
+      for (let i = start; i < offset && protectedKeys.length < 4096; i += block) {
         protectedKeys.push(cacheKey({ url, validator, range: { start: i, end: Math.min(i + block, total) - 1 } }));
       }
-      const saved = await api.playbackCachePrefetch(url, protectedKeys, currentSession.id, list[index].range, validator);
+      const saved = await api.playbackCachePrefetch(url, protectedKeys, currentSession.id, list[index].range, validator, cursor);
       if (stopped || current !== version || !isActive()) return;
       if (saved) { offset += block; failures = 0; delay = 0; }
       else blockedCursor = start;
@@ -347,20 +403,55 @@ export function attachDirectCache(proxyUrl: string, video: HTMLVideoElement, isA
     finally { running = false; if (!stopped) wake(current !== version ? 0 : delay); }
   };
   const getSession = () => {
-    if (!session) {
-      const id = `${Date.now()}-${Math.random().toString(36).slice(2)}-${Math.random().toString(36).slice(2)}`;
-      session = { id, ready: api.playbackCacheStart(id) };
-    }
+    session ??= startCacheSession();
+    syncSession(session, video);
     return session;
   };
-  const reset = () => { version++; offset = 0; total = 0; validator = ""; failures = 0; blockedCursor = -1; lastCursor = -1; stopSession(); wake(); };
-  const seeking = () => { version++; offset = 0; failures = 0; blockedCursor = -1; lastCursor = -1; stopSession(); wake(750); };
+  const fill = async (current: number, cursor: number) => {
+    if (filling || video.readyState < 3 || !canPrefetch(video, 10)) return;
+    filling = true;
+    let again = false;
+    let target: { start: number; end: number } | undefined;
+    try {
+      const pending = await api.playbackCachePending(url);
+      if (stopped || current !== version || !isActive()) return;
+      target = pending.sort((a, b) => Math.abs(a.start - cursor) - Math.abs(b.start - cursor)).find(range => {
+        const failure = fillFailures.get(range.start);
+        return !failure || (failure.count < 3 && failure.retryAt <= Date.now());
+      });
+      if (!target) return;
+      const protectedKeys = [cacheKey({ url, validator, range: target })];
+      for (let i = Math.floor(cursor / block) * block; i < offset && protectedKeys.length < 4096; i += block) {
+        protectedKeys.push(cacheKey({ url, validator, range: { start: i, end: Math.min(i + block, total) - 1 } }));
+      }
+      const currentSession = getSession();
+      await currentSession.ready;
+      if (stopped || current !== version || !isActive() || session !== currentSession) return;
+      const saved = await api.playbackCachePrefetch(url, protectedKeys, currentSession.id, target, validator);
+      if (stopped || current !== version || !isActive()) return;
+      if (!saved) throw new Error("文件块尚未写入");
+      fillFailures.delete(target.start);
+      again = true;
+    } catch {
+      if (target && current === version && !stopped) {
+        const count = (fillFailures.get(target.start)?.count ?? 0) + 1;
+        fillFailures.set(target.start, { count, retryAt: Date.now() + 1000 * 2 ** count });
+      }
+    } finally { filling = false; if (!stopped && (again || current !== version)) wake(0); }
+  };
+  const reset = () => { version++; offset = 0; total = 0; validator = ""; failures = 0; fillFailures.clear(); blockedCursor = -1; lastCursor = -1; stopSession(); wake(); };
+  const seeking = () => { version++; offset = 0; failures = 0; fillFailures.clear(); blockedCursor = -1; lastCursor = -1; stopSession(); wake(750); };
+  const seeked = () => { if (!running && isActive()) wake(0); };
+  const buffering = () => { syncSession(session, video); if (!running && canPrefetch(video)) wake(0); };
+  const progress = () => { emit(); buffering(); };
   const activity = () => { if (!isActive()) { version++; stopSession(); } else reset(); };
-  video.addEventListener("progress", emit);
+  video.addEventListener("progress", progress);
   video.addEventListener("seeking", seeking);
+  video.addEventListener("seeked", seeked);
   video.addEventListener("playback-activity", activity);
+  for (const event of bufferingEvents) video.addEventListener(event, buffering);
   const onCacheChange = () => { enabled = false; emit(); reset(); };
   window.addEventListener("playback-cache-change", onCacheChange);
   wake();
-  return () => { stopped = true; version++; stopSession(); if (timer !== undefined) clearTimeout(timer); video.removeEventListener("progress", emit); video.removeEventListener("seeking", seeking); video.removeEventListener("playback-activity", activity); window.removeEventListener("playback-cache-change", onCacheChange); report([]); };
+  return () => { stopped = true; version++; stopSession(); if (timer !== undefined) clearTimeout(timer); video.removeEventListener("progress", progress); video.removeEventListener("seeking", seeking); video.removeEventListener("seeked", seeked); video.removeEventListener("playback-activity", activity); for (const event of bufferingEvents) video.removeEventListener(event, buffering); window.removeEventListener("playback-cache-change", onCacheChange); report([]); };
 }

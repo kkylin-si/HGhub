@@ -32,9 +32,23 @@ const fixture = {
   pauseBuffering: () => testHls?.pauseBuffering(),
   resumeBuffering: () => testHls?.resumeBuffering(),
   engineState: () => ({ loading: testHls?.loadingEnabled, buffering: testHls?.bufferingEnabled, levels: testHls?.levels.length, subtitleTrack: testHls?.subtitleTrack, subtitleCount: testHls?.subtitleTracks.length, subtitleDisplay: testHls?.subtitleDisplay }),
+  cacheWrites: [] as { url: string; time: number }[],
+  primeCache: (fraction: number) => {
+    const video = document.querySelector("video")!;
+    const fragments = testHls?.levels[testHls.loadLevel]?.details?.fragments ?? [];
+    const index = fragments.findIndex(fragment => fragment.start + fragment.duration > video.duration * fraction);
+    if (index < 0 || index + 7 >= fragments.length) throw new Error("Missing fixture fragments");
+    const url = (offset: number) => new URL(fragments[index + offset].url).searchParams.get("u")!;
+    pendingCache = [url(0), url(1), url(2), url(3), url(6), url(7)];
+    return { url: url(4), edge: fragments[index + 4].start };
+  },
 };
 let testHls: Hls | undefined;
+let pendingCache: string[] | undefined;
+let diskCache = new Set<string>();
+let cacheRevision = 0;
 const diagnosticTest = new URLSearchParams(location.search).has("diagnostics");
+const cacheSeekTest = new URLSearchParams(location.search).has("cache_seek");
 const legacyTest = new URLSearchParams(location.search).has("legacy");
 const initiallyInactive = new URLSearchParams(location.search).has("inactive");
 const subtitleHls = new URLSearchParams(location.search).has("subtitle_hls");
@@ -42,7 +56,11 @@ const mediaSource = () => `https://media.fixture.invalid/${subtitleHls ? "master
 if (diagnosticTest) {
   // Test-only handle: exercise the real engine's public API without rewriting production modules.
   const attach = Hls.prototype.attachMedia;
-  Hls.prototype.attachMedia = function (...args) { testHls = this; return attach.apply(this, args); };
+  Hls.prototype.attachMedia = function (...args) {
+    testHls = this;
+    if (cacheSeekTest) this.config.maxBufferLength = this.config.maxMaxBufferLength = 6;
+    return attach.apply(this, args);
+  };
   let enabled = false;
   playbackLogApi.status = async () => ({ enabled, path: "playback.log", error: null });
   playbackLogApi.set = async (on) => {
@@ -61,10 +79,34 @@ if (diagnosticTest) {
 }
 Object.assign(window, { playerSeekFixture: fixture });
 document.addEventListener("seeking", (e) => {
-  if (e.target instanceof HTMLVideoElement) fixture.seeks.push(e.target.currentTime);
+  if (!(e.target instanceof HTMLVideoElement)) return;
+  fixture.seeks.push(e.target.currentTime);
+  if (pendingCache) {
+    diskCache = new Set(pendingCache);
+    pendingCache = undefined;
+    cacheRevision++;
+    fixture.cacheWrites.length = 0;
+  }
 }, true);
 window.addEventListener("error", (e) => fixture.errors.push(e.message));
-api.playbackCacheStatus = async () => ({ max_mib: 0, bytes: 0, revision: 0 });
+api.playbackCacheStatus = async () => ({ max_mib: cacheRevision ? 256 : 0, bytes: diskCache.size, revision: cacheRevision });
+if (cacheSeekTest) {
+  api.playbackCacheStart = async () => {};
+  api.playbackCacheStop = async () => {};
+  api.playbackCacheReady = async () => {};
+  api.playbackCacheContains = async keys => keys.map(key => diskCache.has(key));
+  api.playbackCachePrefetch = async (url, protectedKeys) => {
+    if (diskCache.has(url)) return true;
+    if (diskCache.size >= 6) {
+      const victim = [...diskCache].find(key => !protectedKeys.includes(key));
+      if (!victim) return false;
+      diskCache.delete(victim);
+    }
+    diskCache.add(url);
+    fixture.cacheWrites.push({ url, time: document.querySelector("video")!.currentTime });
+    return true;
+  };
+}
 api.boot = async () => ({ user: null, logged_in: false, base: "https://fixture.invalid", strict_security: true });
 api.play = async () => ({ id: 991, ep_num: 1, title: "Seek fixture", duration: 90, video_url: mediaSource() });
 api.video = async () => ({

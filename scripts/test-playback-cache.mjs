@@ -35,10 +35,10 @@ try {
     }
     throw new Error('Scheduler spun without yielding');
   };
-  let config, cached, downloads, pending, active, mode, queries, starts, stops;
+  let config, cached, capacity, downloads, pending, active, mode, queries, starts, stops;
   function reset() {
     timers.clear(); now = 0;
-    config = { max_mib: 128, bytes: 0, revision: 0 }; cached = new Set(); downloads = []; pending = new Map();
+    config = { max_mib: 128, bytes: 0, revision: 0 }; cached = new Set(); capacity = Infinity; downloads = []; pending = new Map();
     active = true; mode = 'success'; queries = 0; starts = []; stops = [];
   }
   const key = (url, range, validator) => url + (range ? `\nrange=${range.start}-${range.end}` : '') + (validator ? `\nvalidator=${validator}` : '');
@@ -46,20 +46,32 @@ try {
     playbackCacheStatus: async () => ({ ...config }),
     playbackCacheContains: async keys => { queries++; return keys.map(k => cached.has(k)); },
     playbackCacheStart: async id => { starts.push(id); },
-    playbackCacheStop: async id => { stops.push(id); pending.get(id)?.(new Error('cancelled')); pending.delete(id); },
-    playbackCachePrefetch: async (url, _protected, id, range, validator) => {
-      downloads.push({ url, id, range, validator });
-      if (mode === 'hold') return new Promise((_, reject) => pending.set(id, reject));
+    playbackCacheStop: async id => {
+      stops.push(id);
+      const waits = pending.get(id);
+      for (const reject of Array.isArray(waits) ? waits : waits ? [waits] : []) reject(new Error('cancelled'));
+      pending.delete(id);
+    },
+    playbackCachePrefetch: async (url, protectedKeys, id, range, validator, focus) => {
+      downloads.push({ url, id, range, validator, focus });
+      if (mode === 'hold') return new Promise((_, reject) => pending.set(id, [...(pending.get(id) ?? []), reject]));
       if (mode === 'fail-first' && url.endsWith('/seg0')) throw new Error('HTTP 503');
       if (mode === 'full') return false;
+      if (cached.size >= capacity) {
+        const victim = [...cached].find(key => !protectedKeys.includes(key));
+        if (!victim) return false;
+        cached.delete(victim);
+      }
       cached.add(key(url, range, validator)); return true;
     },
     playbackCacheProbe: async () => ({ total: 2 * 1024 * 1024, tag: 'etag' }),
     playbackCacheCursor: async () => 0,
     playbackCacheObserved: async () => null,
+    playbackCacheReady: async () => {},
+    playbackCachePending: async () => [],
   };
   const { attachPlaybackCache, attachDirectCache, fromDetails, mergeCacheRanges, cacheKey } = await import(pathToFileURL(bundle));
-  class Video extends EventTarget { currentTime = 0; buffered = { length: 0, start() {}, end() {} }; }
+  class Video extends EventTarget { currentTime = 0; readyState = 4; paused = true; seeking = false; playbackRate = 1; buffered = { length: 0, start() {}, end() {} }; }
   class Engine {
     callbacks = new Map();
     on(event, handler) { this.callbacks.set(event, handler); }
@@ -102,6 +114,25 @@ try {
     assert(stops.includes(latest)); const count = downloads.length; await tick(5000); assert.equal(downloads.length, count);
     dispose(); await flush();
   });
+  await check('seeking into a full cache fills the gap before a later cached range', async () => {
+    const video = new Video(), engine = new Engine();
+    const [first, gap, later] = [0, 1, 2].map(n => `https://media.test/seg${n}`);
+    capacity = 2;
+    cached.add(first).add(later);
+    video.currentTime = 9;
+    const dispose = attachPlaybackCache(engine, video, () => active, () => {});
+    engine.details(plain); await tick(500);
+    video.currentTime = 1; video.dispatchEvent(new Event('seeking')); await tick(500);
+    assert(cached.has(first), 'Keep the seek target on disk until it is buffered');
+    assert(cached.has(gap), 'Fill the next gap before playback reaches it');
+
+    video.buffered = { length: 1, start: () => 0, end: () => 4 };
+    video.dispatchEvent(new Event('progress')); await tick(100);
+    assert(cached.has(gap) && cached.has(later), 'Reclaim a buffered block to extend the disk cache');
+    const count = downloads.length; await tick(5000);
+    assert.equal(downloads.length, count, 'Do not fetch the reclaimed block again while it is buffered');
+    dispose(); await flush();
+  });
   await check('capacity changes resume a full queue and zero stops it', async () => {
     mode = 'full'; const video = new Video(), engine = new Engine();
     const dispose = attachPlaybackCache(engine, video, () => active, () => {});
@@ -111,12 +142,87 @@ try {
     config.max_mib = 0; config.revision++; cached.clear(); window.dispatchEvent(new Event('playback-cache-change')); await tick(5000);
     assert.equal(downloads.length, 4); dispose(); await flush();
   });
+  await check('background transfers follow the playback buffer without changing HLS boundaries', async () => {
+    const video = new Video(), engine = new Engine();
+    video.paused = false;
+    let end = 2;
+    video.currentTime = 1.5;
+    video.buffered = { length: 1, start: () => 0, end: () => end };
+    const states = [];
+    const original = globalThis.cacheFixtureApi.playbackCacheReady;
+    globalThis.cacheFixtureApi.playbackCacheReady = async (id, ready) => { states.push({ id, ready }); };
+    mode = 'hold';
+    const dispose = attachPlaybackCache(engine, video, () => active, () => {});
+    try {
+      engine.details(plain); await tick(1000);
+      assert.equal(downloads.length, 0, 'Leave bandwidth to playback when the buffer is short');
+      end = 7; video.dispatchEvent(new Event('progress')); await tick(100);
+      assert.equal(downloads[0].url, 'https://media.test/seg1', 'Use the original 4-8 second fragment containing the buffer end');
+      assert.equal(states.at(-1).ready, true);
+      end = 3; video.dispatchEvent(new Event('timeupdate')); await flush();
+      assert.equal(states.at(-1).ready, false, 'Pause an in-flight background download as the buffer drains');
+      end = 8; video.dispatchEvent(new Event('playing')); await flush();
+      assert.equal(states.at(-1).ready, true);
+      assert.equal(new Set(states.map(state => state.id)).size, 1, 'Resume the same session');
+    } finally { dispose(); await flush(); globalThis.cacheFixtureApi.playbackCacheReady = original; }
+  });
   await check('direct file finishes once and does not rescan at EOF', async () => {
     const video = new Video();
     const dispose = attachDirectCache(`${proxy('movie.mp4')}&direct=1`, video, () => active, () => {});
     await tick(500); assert.equal(downloads.length, 2);
     const before = queries; await tick(10000); assert.equal(downloads.length, 2); assert.equal(queries, before);
     dispose(); await flush();
+  });
+  await check('direct seek fills the first missing block and releases served blocks', async () => {
+    const video = new Video(), url = 'https://media.test/movie.mp4';
+    const block = 1024 * 1024, total = 4 * block;
+    const blockKey = index => key(url, { start: index * block, end: (index + 1) * block - 1 }, 'etag');
+    const fixtureApi = globalThis.cacheFixtureApi;
+    const { playbackCacheProbe, playbackCacheCursor } = fixtureApi;
+    let cursor = total;
+    fixtureApi.playbackCacheProbe = async () => ({ total, tag: 'etag' });
+    fixtureApi.playbackCacheCursor = async () => cursor;
+    capacity = 2;
+    cached.add(blockKey(0)).add(blockKey(3));
+    const dispose = attachDirectCache(proxy('movie.mp4'), video, () => active, () => {});
+    try {
+      await tick(500);
+      assert.equal(downloads.length, 0, 'Cursor at EOF has no blocks to prefetch');
+      video.dispatchEvent(new Event('seeking'));
+      cursor = 0;
+      video.dispatchEvent(new Event('seeked')); await tick(100);
+      assert(cached.has(blockKey(0)) && cached.has(blockKey(1)), 'Prioritize the first gap from the range request');
+      cursor = block;
+      video.dispatchEvent(new Event('progress')); await tick(100);
+      assert(cached.has(blockKey(1)) && cached.has(blockKey(2)), 'Advance beyond bytes already delivered to playback');
+    } finally {
+      dispose(); await flush();
+      Object.assign(fixtureApi, { playbackCacheProbe, playbackCacheCursor });
+    }
+  });
+  await check('direct forward prefetch and partial-block completion run concurrently', async () => {
+    const video = new Video(), block = 1024 * 1024;
+    video.paused = false;
+    video.currentTime = 40;
+    video.buffered = { length: 1, start: () => 35, end: () => 60 };
+    const fixtureApi = globalThis.cacheFixtureApi;
+    const { playbackCacheCursor, playbackCachePending } = fixtureApi;
+    fixtureApi.playbackCacheCursor = async () => block + 100;
+    fixtureApi.playbackCachePending = async () => [{ start: 0, end: block - 1 }];
+    mode = 'hold';
+    const dispose = attachDirectCache(proxy('movie.mp4'), video, () => active, () => {});
+    try {
+      await tick(500);
+      assert.deepEqual(downloads.map(item => item.range.start).sort((a, b) => a - b), [0, block]);
+      assert(downloads.every(item => item.range.end - item.range.start + 1 === block));
+      assert.equal(new Set(downloads.map(item => item.id)).size, 1);
+      assert.equal(downloads.find(item => item.range.start === block).focus, block + 100, 'Continue forward from the received position inside the fixed block');
+      assert.equal(downloads.find(item => item.range.start === 0).focus, undefined, 'Complete the missing prefix independently');
+      const count = downloads.length;
+      active = false; video.dispatchEvent(new Event('playback-activity')); await tick(1000);
+      assert.equal(downloads.length, count);
+      assert(stops.length > 0, 'Cancel both directions when the player becomes inactive');
+    } finally { dispose(); await flush(); Object.assign(fixtureApi, { playbackCacheCursor, playbackCachePending }); }
   });
   await check('native VOD uses the same sequential queue', async () => {
     globalThis.fetch = async () => ({ ok: true, text: async () => `#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\n${proxy('native0')}\n#EXTINF:4,\n${proxy('native1')}\n#EXT-X-ENDLIST\n` });

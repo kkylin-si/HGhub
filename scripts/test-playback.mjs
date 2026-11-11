@@ -157,14 +157,16 @@ async function hlsSubtitleChecks(page) {
 }
 
 async function seekChecks(page, legacy) {
-  await loadPlayer(page, legacy);
+  await loadPlayer(page, legacy, "&cache_seek=1");
   await clickProgress(page, .1);
   assert.equal((await getLogs(page)).length, 0, "Default-off must not record seeks");
   await page.getByRole("button", { name: "诊断设置", exact: true }).click();
   await page.getByRole("button", { name: "播放诊断日志", exact: true }).click();
   await page.waitForFunction(() => document.querySelector('[aria-label="播放诊断日志"]').getAttribute("aria-pressed") === "true");
   await page.getByRole("button", { name: "诊断设置", exact: true }).click();
+  const clickGap = await page.evaluate(() => window.playerSeekFixture.primeCache(.8));
   await clickProgress(page, .8);
+  await page.waitForFunction(({ url, edge }) => window.playerSeekFixture.cacheWrites.some(write => write.url === url && write.time < edge), clickGap);
   let logs = await waitLog(page, "seek.resumed");
   const first = logs.find(e => e.event === "seek.request" && e.data.source === `${legacy ? "legacy" : "desktop"}_click`);
   assert(first, "Actual click must request a seek");
@@ -172,6 +174,7 @@ async function seekChecks(page, legacy) {
   assert(logs.some(e => e.event === "seek.resumed" && e.data.seek === first.data.seek), "Click must recover a frame with matching seek ID");
 
   const before = logs.length;
+  const dragGap = await page.evaluate(() => window.playerSeekFixture.primeCache(.45));
   const r = await page.getByRole("slider", { name: "播放进度" }).boundingBox();
   const current = await page.locator("video").evaluate(v => v.currentTime / v.duration);
   await page.mouse.move(r.x + r.width * current, r.y + r.height / 2);
@@ -186,6 +189,7 @@ async function seekChecks(page, legacy) {
   const preview = await page.getByRole("slider", { name: "播放进度" }).inputValue();
   assert(Math.abs(Number(preview) - 40.5) < .5, "Seekbar must preview the target before release");
   await page.mouse.up();
+  await page.waitForFunction(({ url, edge }) => window.playerSeekFixture.cacheWrites.some(write => write.url === url && write.time < edge), dragGap);
   await page.waitForFunction(n => window.playerSeekFixture.logs.slice(n).some(e => e.event === "seek.resumed"), before);
   logs = (await getLogs(page)).slice(before);
   const drags = logs.filter(e => e.event === "seek.request" && e.data.source === `${legacy ? "legacy" : "desktop"}_drag`);

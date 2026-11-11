@@ -620,7 +620,7 @@ pub async fn playback_cache_contains(urls: Vec<String>) -> Vec<bool> {
     urls.iter().map(|url| crate::media_cache::contains(url)).collect()
 }
 #[tauri::command]
-pub async fn playback_cache_prefetch(url: String, range: Option<crate::media::ByteRange>, validator: Option<String>, protected_urls: Vec<String>, session_id: String) -> Result<bool, String> {
+pub async fn playback_cache_prefetch(url: String, range: Option<crate::media::ByteRange>, validator: Option<String>, protected_urls: Vec<String>, session_id: String, focus: Option<u64>) -> Result<bool, String> {
     let Some(mut cancelled) = crate::media_cache::session(&session_id) else { return Ok(false) };
     if *cancelled.borrow() { return Ok(false); }
     tokio::select! {
@@ -628,7 +628,7 @@ pub async fn playback_cache_prefetch(url: String, range: Option<crate::media::By
         _ = cancelled.changed() => Ok(false),
         result = async {
             let _permit = crate::media_cache::PREFETCH_SLOT.acquire().await.map_err(|_| "缓存调度已关闭")?;
-            crate::media::prefetch_segment(&url, range, validator.as_deref(), &protected_urls).await
+            crate::media::prefetch_segment(&url, range, validator.as_deref(), &protected_urls, focus).await
         } => result,
     }
 }
@@ -642,13 +642,17 @@ pub async fn playback_cache_probe(url: String, session_id: String) -> Result<Val
         _ = cancelled.changed() => Err("预缓存任务已取消".into()),
         result = async {
             let _permit = crate::media_cache::PREFETCH_SLOT.acquire().await.map_err(|_| "缓存调度已关闭")?;
-            let (total, tag) = crate::media::probe_direct(&url).await?;
+            let (total, tag) = crate::media::probe_direct(&url, false).await?;
             Ok(json!({"total": total, "tag": tag}))
         } => result,
     }
 }
 #[tauri::command]
 pub async fn playback_cache_cursor(url: String) -> u64 { crate::media::direct_cursor(&url) }
+#[tauri::command]
+pub async fn playback_cache_pending(url: String) -> Value { json!(crate::media::direct_pending(&url)) }
+#[tauri::command]
+pub async fn playback_cache_ready(session_id: String, ready: bool) { crate::media_cache::buffer_ready(&session_id, ready); }
 #[tauri::command]
 pub async fn playback_cache_start(session_id: String) -> Result<(), String> { crate::media_cache::start_session(session_id) }
 #[tauri::command]
@@ -691,10 +695,10 @@ mod tests {
     #[tokio::test]
     async fn cancelled_prefetch_does_not_wait_for_the_background_slot() {
         let _guard = crate::media_cache::TEST_LOCK.lock().unwrap();
-        let permit = crate::media_cache::PREFETCH_SLOT.acquire().await.unwrap();
+        let permit = crate::media_cache::PREFETCH_SLOT.acquire_many(2).await.unwrap();
         let id = "cancel-queued-prefetch";
         crate::media_cache::start_session(id.into()).unwrap();
-        let task = tokio::spawn(super::playback_cache_prefetch("https://example.test/unused".into(), None, None, vec![], id.into()));
+        let task = tokio::spawn(super::playback_cache_prefetch("https://example.test/unused".into(), None, None, vec![], id.into(), None));
         tokio::task::yield_now().await;
         crate::media_cache::cancel_session(id);
         let result = tokio::time::timeout(std::time::Duration::from_secs(1), task).await.unwrap().unwrap().unwrap();
