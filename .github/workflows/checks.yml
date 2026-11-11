@@ -67,6 +67,9 @@ jobs:
           distribution: temurin
           java-version: '17'
       - uses: android-actions/setup-android@v3
+        with:
+          # Override the action's default, which includes the retired "tools" package.
+          packages: platform-tools
       - run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0'
       - name: Build without release signing credentials and run tests
         working-directory: native/android

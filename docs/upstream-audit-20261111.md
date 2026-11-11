@@ -41,7 +41,7 @@ Gradle zip 固定值为 `f397b287023acdba1e9f6fc5ea72d22dd63669d59ed4a289a29b1a7
 - `pnpm test:api-loading`：首页与分类的 2 组错误、重试、按需加载回归通过。
 - `pnpm test:playback`：16 个场景通过，包含真实 Rust 缓存桥接、MP4 范围请求复用、HLS、字幕、历史恢复、片尾回拖、自动续集与失效存储；测试拦截外部请求，不发送真实账号。
 - 原生 Android：使用隔离安装、按官方摘要校验的 JDK 17 / Gradle 8.11.1 和 Android SDK 36 完成 `:app:assembleDebug :app:testDebugUnitTest`，生成 debug APK，4 项安全测试全部通过（0 failed / 0 errors）。覆盖密码与 token 不跟随重定向、游客 POST 信封保持、私网跳转拒绝、混合 DNS 答案、IPv4/IPv6 变体及 FakeIP。没有使用发布签名密钥，也未在真机运行 Android Keystore 或播放器。
-- 原生 iOS：本机是 Linux，未运行 Xcode、Keychain/AVPlayer 或 Swift 回归；已加入 macOS CI 编译及会话竞态、请求重放、地址策略、代理 capability 和 SIGPIPE 测试，合并前需要这些检查通过。
+- 原生 iOS：本机是 Linux；后续 [GitHub macOS CI](https://github.com/kkylin-si/HGhub/actions/runs/43035957245/job/130574692216) 已通过模拟器编译、Swift 安全回归与 SIGPIPE 测试。尚未在 iOS 真机验证 Keychain/AVPlayer。
 - workflow YAML、XML、plist、Python 脚本语法及 `git diff --check`：通过。
 
 ## 剩余边界
@@ -50,4 +50,6 @@ iOS 的 DNS 检查发生在 URLSession 连接前，不能像 Rust 的 resolve_to
 
 桌面 session.json 仍是当前用户可读的明文，Unix 已限制权限，Windows 依赖应用数据目录的用户 ACL；同一用户权限下的恶意进程不在此保护范围内。旧日志、旧备份或已复制的诊断不会被本次升级追溯清除。第三方依赖与业务响应的资源消耗仍需持续维护，本次未将已有媒体能力改成不兼容的大小限制。
 
-本次未向 GitHub push、创建 PR、发布安装包或变更仓库保护设置；这些操作不属于本地整备结果本身。
+## CI 后续修正
+
+首次推送后的 Android job 在 SDK 准备阶段失败：`android-actions/setup-android@v3` 默认安装 `tools platform-tools`，其中旧包 `tools` 已无法从 SDK 仓库获取。工作流显式设置 `packages: platform-tools`，保留后续 Android 36 / build-tools 36.0.0 安装；不修改应用功能或测试内容。此修复推送到 fork 的 `security-audit` 分支重新验证；未创建 PR、发布安装包或变更目标 main 及仓库保护设置。
