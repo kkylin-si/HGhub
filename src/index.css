@@ -556,3 +556,6 @@ html.theme-light .article-body { color: rgba(20,24,30,.82); }
 .hg-tabbar button:focus-visible,
 .hg-player-ui button:focus,
 .hg-player-ui button:focus-visible { outline: none; }
+
+/* Eight previews fill wide containers and retain horizontal scrolling on phones. */
+.category-preview > button { flex: 1 0 104px; min-width: 0; }
