@@ -38,6 +38,7 @@ type Props = {
   volume?: number;
   rate?: number;
   onTime?: (t: number) => void;
+  onSeekRequest?: (t: number, source: string) => void;
   onCacheRanges?: (ranges: CacheRange[]) => void;
   onDuration?: (d: number) => void;
   onSize?: (w: number, h: number) => void;
@@ -55,7 +56,7 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
   { src, poster, autoPlay = true, active = true, diagnosticContext = {}, muted = false, subtitlesEnabled = true, loop = false, fit = "contain",
     scale = 1, panX = 0, panY = 0, isGesturing = false,
     volume = 1, rate = 1,
-    onTime, onCacheRanges, onDuration, onSize, onPlaying, onPause, onWaiting, onEnded, onError, onClick, className = "" },
+    onTime, onSeekRequest, onCacheRanges, onDuration, onSize, onPlaying, onPause, onWaiting, onEnded, onError, onClick, className = "" },
   ref,
 ) {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -89,6 +90,7 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
     const autoResume = typeof sourceOrAutoResume === "boolean" ? sourceOrAutoResume : !v.paused;
 
     requestSeek(target, source);
+    onSeekRequest?.(target, source);
     onWaiting?.();
     if (hlsRef.current?.bufferingEnabled) {
       try {

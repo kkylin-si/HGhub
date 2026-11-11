@@ -14,14 +14,14 @@ import { createServer as createViteServer } from "vite";
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const { values: args } = parseArgs({ options: {
   "media-dir": { type: "string" }, output: { type: "string" }, "browser-executable": { type: "string" },
-  scenarios: { type: "string", default: "seek,legacy,stall,lifecycle,mms,subtitles,subtitles-legacy,subtitles-hls" }, help: { type: "boolean" },
+  scenarios: { type: "string", default: "seek,legacy,stall,lifecycle,mms,subtitles,subtitles-legacy,subtitles-hls,resume,progress" }, help: { type: "boolean" },
 } });
 if (args.help) {
-  console.log("pnpm test:playback [--media-dir DIR] [--output NEW_DIR] [--browser-executable PATH] [--scenarios seek,legacy,stall,lifecycle,mms,subtitles,subtitles-legacy,subtitles-hls]");
+  console.log("pnpm test:playback [--media-dir DIR] [--output NEW_DIR] [--browser-executable PATH] [--scenarios seek,legacy,stall,lifecycle,mms,subtitles,subtitles-legacy,subtitles-hls,resume,progress]");
   process.exit(0);
 }
 const scenarios = args.scenarios.split(",");
-assert(scenarios.length && scenarios.every(s => ["seek", "legacy", "stall", "lifecycle", "mms", "subtitles", "subtitles-legacy", "subtitles-hls"].includes(s)), "Unknown scenario");
+assert(scenarios.length && scenarios.every(s => ["seek", "legacy", "stall", "lifecycle", "mms", "subtitles", "subtitles-legacy", "subtitles-hls", "resume", "progress"].includes(s)), "Unknown scenario");
 const output = resolve(args.output || join(root, "test-results", "playback", new Date().toISOString().replace(/[:.]/g, "-")));
 await mkdir(dirname(output), { recursive: true });
 await mkdir(output); // Refuse to overwrite artifacts from an earlier run.
@@ -357,6 +357,172 @@ async function lifecycleCheck(page) {
   return { feed, legacy, late_mount_paused: true };
 }
 
+async function loadResumeFixture(page) {
+  await page.addInitScript(() => {
+    if (sessionStorage.getItem('progress-fixture-seeded')) return;
+    sessionStorage.setItem('progress-fixture-seeded', '1');
+    // The old format has no independent progress map.
+    localStorage.setItem('hghub_app_v1', JSON.stringify({ favs: [991], history: [
+      { id: 991, ep: 3, t: 35, dur: 90, at: Date.now() },
+      { id: 992, ep: 4, t: 22, dur: 90, at: Date.now() - 1 },
+    ] }));
+  });
+  await page.goto(`${report.ui}/tests/player-seek.html?diagnostics=1&resume=1&proxy=${encodeURIComponent(report.media)}`);
+  await page.getByRole('region', { name: 'AI成人短剧', exact: true }).getByText('续播视频 991', { exact: true }).waitFor();
+}
+const openCategoryVideo = page => page.getByRole('region', { name: 'AI成人短剧', exact: true }).getByRole('button', { name: /续播视频 991/ }).click();
+async function expectPlayback(page, ep, time, id = 991) {
+  await page.waitForFunction(({ ep, time, id }) => {
+    const fixture = window.playerSeekFixture, video = document.querySelector('video');
+    const content = video?.closest('section')?.textContent ?? '';
+    return fixture.playRequests.some(request => request.id === id && request.ep === ep)
+      && content.includes(`续播视频 ${id}`) && content.includes(`第 ${ep}/8 集`)
+      && fixture.getProgress(id)?.ep === ep && video && !video.paused && !video.seeking && video.readyState >= 2
+      && video.currentTime >= time && video.currentTime < time + 6;
+  }, { ep, time, id });
+}
+async function backFromPlayer(page) {
+  await page.mouse.move(450, 100);
+  await page.getByRole('button', { name: '返回', exact: true }).last().click();
+  await page.locator('video').waitFor({ state: 'detached' });
+}
+async function pickEpisode(page, ep) {
+  await page.locator('input[aria-label="播放进度"]').evaluate(input => input.blur());
+  await page.keyboard.press('e');
+  await page.getByRole('button', { name: String(ep), exact: true }).click();
+}
+async function resumeChecks(page) {
+  await loadResumeFixture(page);
+  let release, intercepted;
+  const gate = new Promise(resolve => { release = resolve; });
+  const manifest = new Promise(resolve => { intercepted = resolve; });
+  await page.route('**/hls?*', async route => {
+    intercepted(); await gate; await route.continue().catch(() => {});
+  });
+  try {
+    await openCategoryVideo(page);
+    await manifest;
+    const progress = await page.evaluate(() => window.playerSeekFixture.getProgress(991));
+    assert.equal(progress.ep, 3);
+    assert.equal(progress.t, 35, 'Loading must preserve the saved position');
+    release();
+    await expectPlayback(page, 3, 35);
+  } finally { release(); await page.unroute('**/hls?*'); }
+  assert((await page.evaluate(() => window.playerSeekFixture.playRequests)).every(request => request.id !== 991 || request.ep === 3), 'Category must request the saved episode directly');
+
+  await page.mouse.move(450, 450);
+  await page.getByRole('button', { name: '暂停', exact: true }).click();
+  await clickProgress(page, .5);
+  await page.waitForFunction(() => !document.querySelector('video').seeking && document.querySelector('video').currentTime >= 44);
+  const snapshot = await page.evaluate(() => {
+    window.dispatchEvent(new Event('pagehide'));
+    return JSON.parse(localStorage.getItem('hghub_app_v1')).progress[991];
+  });
+  assert(Math.abs(snapshot.t - 45) < 1, 'Page lifecycle saves must reach localStorage synchronously');
+  await page.locator('video').evaluate(video => { video.currentTime = 46; });
+  await page.waitForFunction(() => !document.querySelector('video').seeking && document.querySelector('video').currentTime >= 46);
+  const background = await page.evaluate(() => {
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
+    document.dispatchEvent(new Event('visibilitychange'));
+    delete document.visibilityState;
+    return JSON.parse(localStorage.getItem('hghub_app_v1')).progress[991];
+  });
+  assert(Math.abs(background.t - 46) < 1, 'Backgrounding must flush the current position');
+  await backFromPlayer(page);
+  await page.getByRole('button', { name: '收藏入口', exact: true }).click();
+  await page.getByRole('button', { name: /续播视频 991/ }).click();
+  await expectPlayback(page, 3, 45);
+  await backFromPlayer(page);
+  await page.getByRole('button', { name: '观看历史', exact: true }).click();
+  await page.getByRole('button', { name: /续播视频 991/ }).click();
+  await expectPlayback(page, 3, 45);
+  await backFromPlayer(page);
+  await page.getByRole('button', { name: '搜索入口', exact: true }).click();
+  await page.getByPlaceholder('搜索短剧、作者、题材…').fill('续播');
+  await page.getByPlaceholder('搜索短剧、作者、题材…').press('Enter');
+  await page.getByRole('button', { name: /续播视频 991/ }).click();
+  await expectPlayback(page, 3, 45);
+  await pickEpisode(page, 2);
+  await expectPlayback(page, 2, 0);
+  await page.evaluate(() => { window.playerSeekFixture.failEpisode = 4; });
+  await pickEpisode(page, 4);
+  await page.getByText('Fixture episode unavailable', { exact: true }).waitFor();
+  assert.equal(await page.evaluate(() => window.playerSeekFixture.getProgress(991).ep), 2, 'An unavailable episode must not replace the last played episode');
+  await page.reload();
+  await openCategoryVideo(page);
+  await expectPlayback(page, 2, 0);
+  await backFromPlayer(page);
+  await page.getByRole('region', { name: 'AI成人短剧', exact: true }).getByText('全部', { exact: true }).click();
+  await page.getByRole('button', { name: /续播视频 991/ }).last().click();
+  await expectPlayback(page, 2, 0);
+  await page.locator('input[aria-label="播放进度"]').evaluate(input => input.blur());
+  await page.keyboard.press('ArrowUp');
+  await expectPlayback(page, 4, 22, 992);
+  await page.keyboard.press('ArrowDown');
+  await expectPlayback(page, 2, 0);
+  await page.evaluate(() => { window.playerSeekFixture.failEpisode = 4; });
+  await pickEpisode(page, 4);
+  await page.getByText('Fixture episode unavailable', { exact: true }).waitFor();
+  await page.evaluate(() => { window.playerSeekFixture.failEpisode = 0; });
+  await pickEpisode(page, 4);
+  await expectPlayback(page, 4, 0);
+  return { category: true, channel: true, favorites: true, history: true, search: true, neighboring_video: true, explicit_episode: true, failed_episode_preserved: true, same_episode_retry: true, lifecycle_flush: true };
+}
+
+async function progressChecks(page) {
+  await loadResumeFixture(page);
+  await openCategoryVideo(page);
+  await expectPlayback(page, 3, 35);
+  const initial = await page.evaluate(() => window.playerSeekFixture.getProgress(991).t);
+  await page.waitForFunction(time => window.playerSeekFixture.getProgress(991).t >= time + 4, initial);
+  await page.evaluate(() => window.playerSeekFixture.setActive(false));
+  const hidden = await page.evaluate(() => JSON.parse(localStorage.getItem('hghub_app_v1')).progress[991]);
+  assert.equal(hidden.ep, 3);
+  assert(hidden.t >= 35);
+  const resumeTime = Math.floor(hidden.t);
+  await backFromPlayer(page);
+  const retained = await page.evaluate(() => {
+    for (let i = 1000; i < 1081; i++) window.playerSeekFixture.record(i, 6, 17, 90);
+    const saved = JSON.parse(localStorage.getItem('hghub_app_v1'));
+    return { count: saved.history.length, recent: saved.history.some(entry => entry.id === 991), old: saved.progress[991] };
+  });
+  assert.equal(retained.count, 80);
+  assert.equal(retained.recent, false);
+  assert.equal(retained.old.ep, 3);
+  await page.reload(); await openCategoryVideo(page); await expectPlayback(page, 3, resumeTime);
+  await page.evaluate(() => {
+    const fixture = window.playerSeekFixture;
+    const oldWriter = fixture.claim(991), newWriter = fixture.claim(991);
+    fixture.record(991, 7, 12, 90, newWriter);
+    fixture.record(991, 1, 0, 90, oldWriter);
+  });
+  assert.equal(await page.evaluate(() => window.playerSeekFixture.getProgress(991).ep), 7, 'Stale player cleanup cannot overwrite a newer writer');
+  const cleared = await page.evaluate(() => {
+    const fixture = window.playerSeekFixture, writer = fixture.claim(991);
+    fixture.clearHistory();
+    fixture.record(991, 7, 12, 90, writer);
+    window.dispatchEvent(new Event('pagehide'));
+    const saved = JSON.parse(localStorage.getItem('hghub_app_v1'));
+    return { history: saved.history, progress: saved.progress };
+  });
+  assert.deepEqual(cleared, { history: [], progress: {} });
+  await page.reload(); await openCategoryVideo(page); await expectPlayback(page, 1, 0);
+  await page.evaluate(() => {
+    // Invalidate the current player before seeding the completion scenario.
+    window.playerSeekFixture.claim(991);
+    window.playerSeekFixture.record(991, 3, 85, 90);
+  });
+  await page.reload(); await openCategoryVideo(page); await expectPlayback(page, 3, 85);
+  await page.evaluate(() => { window.playerSeekFixture.failEpisode = 4; });
+  await clickProgress(page, .999);
+  await page.getByText('Fixture episode unavailable', { exact: true }).waitFor();
+  const ended = await page.evaluate(() => window.playerSeekFixture.getProgress(991));
+  assert.equal(ended.ep, 3, 'Only actual playback of the next episode can advance the saved episode');
+  assert.equal(ended.t, ended.dur);
+  await backFromPlayer(page); await openCategoryVideo(page); await expectPlayback(page, 3, 0);
+  return { legacy_migration: true, periodic_save: true, retention_beyond_80: true, restart_persistence: true, inactive_flush: true, stale_writer_rejected: true, explicit_clear: true, completed_episode_replay: true };
+}
+
 try {
   let mediaDir = args["media-dir"] && resolve(args["media-dir"]);
   if (!mediaDir) {
@@ -394,7 +560,7 @@ try {
     const result = { name, status: "running", started: new Date().toISOString() }; report.cases.push(result);
     let deadline;
     try {
-      const action = name === "subtitles-hls" ? hlsSubtitleChecks(page) : name.startsWith("subtitles") ? subtitleChecks(page, name === "subtitles-legacy") : name === "seek" || name === "legacy" ? seekChecks(page, name === "legacy") : name === "stall" ? stallCheck(page) : name === "mms" ? managedMediaCheck(page) : lifecycleCheck(page);
+      const action = name === "resume" ? resumeChecks(page) : name === "progress" ? progressChecks(page) : name === "subtitles-hls" ? hlsSubtitleChecks(page) : name.startsWith("subtitles") ? subtitleChecks(page, name === "subtitles-legacy") : name === "seek" || name === "legacy" ? seekChecks(page, name === "legacy") : name === "stall" ? stallCheck(page) : name === "mms" ? managedMediaCheck(page) : lifecycleCheck(page);
       result.metrics = await Promise.race([action, new Promise((_, reject) => { deadline = setTimeout(() => reject(new Error("Scenario exceeded 45 seconds")), 45000); })]);
       assert.deepEqual(pageErrors, [], "Browser script errors");
       assert.deepEqual(externalRequests, [], "Unexpected external network requests");

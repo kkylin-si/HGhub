@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { api, cover, fmt, fmtTime, isMobile } from "../api";
 import type { Detail, Episode, Post, VideoCard } from "../types";
 import { useStore } from "../store";
+import { useWatchProgress } from "../useWatchProgress";
 import { Avatar, Img, Sheet } from "./ui";
 import VideoSurface, { type VideoHandle } from "./VideoSurface";
 import PlayerControls from "./PlayerControls";
@@ -32,13 +33,13 @@ type Props = {
 
 export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind = "video", active, bottomInset, onBack, onNearEnd, startEp, startTime }: Props) {
   const store = useStore();
-  const { isLiked, isFav, toggleLikeLocal, toggleFavLocal, toggleFollowLocal, muted, setMuted, subtitlesEnabled, setSubtitlesEnabled, volume, setVolume, toast, addHistory, user, setLoginOpen } = store;
+  const { isLiked, isFav, toggleLikeLocal, toggleFavLocal, toggleFollowLocal, muted, setMuted, subtitlesEnabled, setSubtitlesEnabled, volume, setVolume, toast, user, setLoginOpen } = store;
   const isDesktop = !isMobile;
 
   const boxRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<VideoHandle>(null);
   const [index, setIndex] = useState(startIndex);
-  const [epMap, setEpMap] = useState<Record<number, number>>(() => (startEp ? { [videoIds[startIndex]]: startEp } : {}));
+  const progress = useWatchProgress({ id: videoIds[index], active, videoRef, startEp, startTime });
   const [details, setDetails] = useState<Record<number, Detail>>({});
   const [playUrls, setPlayUrls] = useState<Record<string, string>>({});
   const [cards] = useState<Record<number, VideoCard>>({});
@@ -57,13 +58,6 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   const [playTry, setPlayTry] = useState(0);
   const [panel, setPanel] = useState<"episodes" | "comments" | "article" | "detail" | null>(null);
   const [descOpen, setDescOpen] = useState(false);
-  /* 续播：拿到时长后再 seek 一次（只对进入时那一条生效） */
-  const resumeRef = useRef<{ key: string; t: number } | null>(
-    startTime && startTime > 1 ? { key: `${videoIds[startIndex]}:${startEp || 1}`, t: startTime } : null,
-  );
-  /* 观看进度：onTime 里节流写回 store，卸载时再兜一次 */
-  const liveRef = useRef({ id: 0, ep: 1, dur: 0, t: 0 });
-  const lastSaveRef = useRef(0);
   const theater = store.theater;
   const setTheater = store.setTheater;
   const fs = store.fs;
@@ -127,7 +121,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
 
   const curId = videoIds[index];
   const detail = details[curId];
-  const curEp = epMap[curId] || 1;
+  const curEp = progress.episode;
   const playKey = `${curId}:${curEp}`;
   const playUrl = playUrls[playKey] || "";
   useEffect(() => { videoRef.current?.trace("page.active", { active, view: mode, video_id: curId, episode: curEp }); }, [active, mode, curId, curEp]);
@@ -136,27 +130,16 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
 
   /* 观看进度：onTime 里每 5 秒落一次；拖动进度条期间忽略底层 timeupdate 防止进度条回跳 */
   const onTimeTick = (t: number) => {
-    liveRef.current = { id: curId, ep: curEp, dur: duration, t };
-    if (!barScrub.current && gesture.current?.mode !== "scrub") {
+    if (progress.onTime() && !barScrub.current && gesture.current?.mode !== "scrub") {
       setTime(t);
-    }
-    const now = Date.now();
-    if (duration > 0 && now - lastSaveRef.current > 5000) {
-      lastSaveRef.current = now;
-      addHistory(curId, curEp, t, duration);
     }
   };
 
-  /* 拿到时长后再续播：只对进入时那一条生效，且不跳到片尾 */
+  /* 媒体时长可用后恢复当前条目的进度 */
   const onDurationTick = (d: number) => {
     setDuration(d);
-    liveRef.current = { ...liveRef.current, dur: d };
-    const r = resumeRef.current;
-    if (r && r.key === playKey && r.t > 1 && (!d || r.t < d - 3)) {
-      resumeRef.current = null;
-      videoRef.current?.seek(r.t, "history_resume");
-      setTime(r.t);
-    }
+    const target = progress.onDuration(d);
+    if (target !== undefined) setTime(target);
   };
 
   /** 统一视图模型：短剧与吃瓜帖子共用同一套播放界面 */
@@ -371,12 +354,11 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
         if (!alive) return;
         if (!info?.video_url) throw new Error("暂无播放地址");
         setPlayUrls((m) => ({ ...m, [playKey]: info.video_url }));
-        addHistory(curId, curEp);
       })
       .catch((e) => { if (alive) setErr((e as Error).message || "取播放地址失败"); });
     return () => { alive = false; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [curId, curEp, playTry]);
+  }, [curId, curEp, playTry, progress.key]);
 
   /* 切换条目/集数时重置播放与缩放状态 */
   useEffect(() => {
@@ -384,7 +366,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
     setVsize({ w: 0, h: 0 });
     setPortraitFit("contain");
     setZoom({ scale: 1, x: 0, y: 0, gesturing: false });
-  }, [playKey]);
+  }, [progress.key]);
 
   /* 进出全屏时复位双指缩放并校准滚动条位置 */
   useEffect(() => {
@@ -404,11 +386,9 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   /* 倍速同步（长按 2x / 锁定 2x / 基准倍速） */
   useEffect(() => { videoRef.current?.rate(effRate); }, [effRate, playKey]);
 
-  /* 离开播放页时把最后位置落盘并清理计时器 */
+  /* 离开播放页时清理单击计时器 */
   useEffect(() => () => {
     clearTapTimer();
-    const s = liveRef.current;
-    if (s.id && s.dur) addHistory(s.id, s.ep, s.t, s.dur);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -760,7 +740,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
   };
 
   const pickEp = (ep: number) => {
-    setEpMap((m) => ({ ...m, [curId]: ep }));
+    progress.selectEpisode(ep);
     setPanel(null);
   };
 
@@ -816,6 +796,7 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                     onPointerCancel={(e) => onUp(e, true)}
                     onLostPointerCapture={(e) => onUp(e, true)}>
                     <VideoSurface
+                      key={progress.key}
                       ref={videoRef}
                       src={playUrl}
                       poster={fs ? undefined : posterUrl}
@@ -833,13 +814,18 @@ export default function Feed({ videoIds, startIndex = 0, title = "", mode, kind 
                       isGesturing={zoom.gesturing}
                       onClick={() => { if (isDesktop) videoRef.current?.toggle(); }}
                       onTime={onTimeTick}
+                      onSeekRequest={progress.onSeekRequest}
                       onCacheRanges={setCachedRanges}
                       onDuration={onDurationTick}
                       onSize={(w, h) => setVsize({ w, h })}
-                      onPlaying={() => { setPaused(false); setWaiting(false); setErr(""); }}
-                      onPause={() => setPaused(true)}
+                      onPlaying={() => { progress.onPlaying(); setPaused(false); setWaiting(false); setErr(""); }}
+                      onPause={() => { progress.onPause(); setPaused(true); }}
                       onWaiting={() => setWaiting(true)}
-                      onEnded={() => { const next = episodes.find((e) => e.ep_num === curEp + 1); if (next) pickEp(next.ep_num); }}
+                      onEnded={() => {
+                        if (!progress.onEnded()) return;
+                        const next = episodes.find((e) => e.ep_num === curEp + 1);
+                        if (next) pickEp(next.ep_num);
+                      }}
                       onError={(m) => setErr(m)}
                     />
                   </div>

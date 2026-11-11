@@ -1,13 +1,16 @@
 import React, { useState } from "react";
 import { createRoot } from "react-dom/client";
 import Feed from "../src/components/Feed";
-import { AppProvider } from "../src/store";
+import { AppProvider, useStore, type WatchProgress } from "../src/store";
 import { api } from "../src/api";
 import "../src/index.css";
 import { flushPlaybackLog, initPlaybackLog, playbackLogApi, setPlaybackLog } from "../src/playbackDiagnostics";
 import Settings from "../src/pages/Settings";
 import Player from "../src/components/Player";
 import Hls from "hls.js";
+import Category, { ChannelPage } from "../src/pages/Category";
+import Profile from "../src/pages/Profile";
+import Search from "../src/pages/Search";
 
 // 仅将自定义媒体协议映射到本地测试服务器；播放器、HLS 和鼠标事件均使用真实实现。
 const proxy = new URLSearchParams(location.search).get("proxy") || "http://127.0.0.1:17779";
@@ -25,6 +28,12 @@ const fixture = {
   setActive: (_active: boolean) => {},
   nextSource: () => {},
   sourceKey: 0,
+  playRequests: [] as { id: number; ep: number }[],
+  failEpisode: 0,
+  getProgress: (_id: number): WatchProgress | undefined => undefined,
+  record: (_id: number, _ep: number, _time: number, _duration: number, _writer?: number) => {},
+  claim: (_id: number) => 0,
+  clearHistory: () => {},
   logs: [] as { event: string; data: Record<string, unknown> }[],
   setLogging: setPlaybackLog,
   flushLogs: flushPlaybackLog,
@@ -52,6 +61,7 @@ const cacheSeekTest = new URLSearchParams(location.search).has("cache_seek");
 const legacyTest = new URLSearchParams(location.search).has("legacy");
 const initiallyInactive = new URLSearchParams(location.search).has("inactive");
 const subtitleHls = new URLSearchParams(location.search).has("subtitle_hls");
+const resumeTest = new URLSearchParams(location.search).has("resume");
 const mediaSource = () => `https://media.fixture.invalid/${subtitleHls ? "master" : "list"}.m3u8${fixture.sourceKey ? `?source=${fixture.sourceKey}` : ""}`;
 if (diagnosticTest) {
   // Test-only handle: exercise the real engine's public API without rewriting production modules.
@@ -108,14 +118,54 @@ if (cacheSeekTest) {
   };
 }
 api.boot = async () => ({ user: null, logged_in: false, base: "https://fixture.invalid", strict_security: true });
-api.play = async () => ({ id: 991, ep_num: 1, title: "Seek fixture", duration: 90, video_url: mediaSource() });
-api.video = async () => ({
-  id: 991, title: "Seek fixture", description: "", cover: "", tags: [], score: 0,
-  episode_count: 1, total_episodes: 1,
-  episodes: [{ ep_num: 1, title: "one", duration: 90, status: 1 }],
+api.play = async (id, ep = 1) => {
+  fixture.playRequests.push({ id, ep });
+  if (fixture.failEpisode === ep) throw new Error("Fixture episode unavailable");
+  return { id, ep_num: ep, title: "Seek fixture", duration: 90,
+    video_url: mediaSource() + (resumeTest ? `?video=${id}&episode=${ep}` : "") };
+};
+api.video = async (id) => ({
+  id, title: resumeTest ? `续播视频 ${id}` : "Seek fixture", description: "", cover: "", tags: [], score: 0,
+  episode_count: resumeTest ? 8 : 1, total_episodes: resumeTest ? 8 : 1,
+  episodes: Array.from({ length: resumeTest ? 8 : 1 }, (_, i) => ({ ep_num: i + 1, title: `episode ${i + 1}`, duration: 90, status: 1 })),
   counts: { like: 0, collect: 0, comment: 0, hot: 0 },
   author: { id: 1, name: "Fixture" }, is_finished: true, is_original: 0,
 });
+if (resumeTest) {
+  const items = [991, 992].map(id => ({
+    id, title: `续播视频 ${id}`, cover: "", tags: [], score: 0, hot: 0,
+    episode_count: 8, total_episodes: 8, like_count: 0, comment_count: 0, collect_count: 0, is_finished: true, is_original: 0,
+  }));
+  const pagination = { page: 1, pages: 1, size: 20, total: items.length };
+  api.category = async () => ({ items, pagination });
+  api.search = async keyword => ({ items, pagination, keyword });
+  api.posts = async () => ({ items: [], pagination: { ...pagination, total: 0 } });
+}
+
+function ResumeRoutes({ active }: { active: boolean }) {
+  const store = useStore();
+  const [entry, setEntry] = useState("category");
+  fixture.getProgress = store.getWatchProgress;
+  fixture.record = store.addHistory;
+  fixture.claim = store.claimWatchProgress;
+  fixture.clearHistory = store.clearHistory;
+  return <>
+    <div style={{ position: "relative", width: 900, height: 540 }}>
+      {entry === "category" ? <Category wide active={!store.stack.length} />
+        : entry === "search" ? <Search wide active={!store.stack.length} /> : <Profile key={entry} wide />}
+      {store.stack.map((page, i) => <div key={page.key} className="absolute inset-0 bg-bg" style={{ zIndex: 30 + i }}>
+        {page.kind === "feed"
+          ? <Feed videoIds={page.videoIds} startIndex={page.index} startEp={page.startEp} startTime={page.startTime}
+              mode="context" title={page.title} active={active && i === store.stack.length - 1} bottomInset={0} onBack={store.pop} />
+          : page.kind === "channel" ? <ChannelPage cate={page.cate} name={page.name} onBack={store.pop} wide /> : null}
+      </div>)}
+    </div>
+    <button onClick={() => setEntry("category")}>分类入口</button>
+    <button onClick={() => setEntry("favorites")}>收藏入口</button>
+    <button onClick={() => setEntry("search")}>搜索入口</button>
+    <button onClick={store.clearHistory}>清除续播测试记录</button>
+  </>;
+}
 function Fixture() {
   const [active, setActive] = useState(!initiallyInactive);
   const [settings, setSettings] = useState(false);
@@ -124,17 +174,17 @@ function Fixture() {
   fixture.nextSource = () => setSourceKey(key => key + 1);
   fixture.setActive = setActive;
   return <AppProvider>
-    <div style={{ position: "relative", width: 900, height: 540 }}>
+    {resumeTest ? <ResumeRoutes active={active} /> : <div style={{ position: "relative", width: 900, height: 540 }}>
       {legacyTest
         ? <Player key={sourceKey} src={mediaSource()} autoPlay active={active} className="w-full h-full" diagnosticContext={{ video_id: 991, active }} />
         : <Feed key={sourceKey} videoIds={[991]} mode="home" active={active} bottomInset={0} />}
-    </div>
+    </div>}
     <button onClick={() => setActive((v) => !v)}>切换播放页激活状态</button>
     {diagnosticTest && <button onClick={() => setSettings(v => !v)}>诊断设置</button>}
     {settings && <div style={{ position: "relative", width: 900, height: 700 }}><Settings onBack={() => setSettings(false)} wide /></div>}
   </AppProvider>;
 }
-createRoot(document.querySelector("#root")!).render(<Fixture />);
+createRoot(document.querySelector("#root")!).render(resumeTest ? <React.StrictMode><Fixture /></React.StrictMode> : <Fixture />);
 
 // 自动检查真正的浏览器命中测试，而非仅匹配 CSS 字符串。
 async function checkIdleSeekTarget() {
@@ -154,7 +204,7 @@ async function checkIdleSeekTarget() {
   }
   throw new Error("等待播放或控制条隐藏超时");
 }
-if (!legacyTest && !initiallyInactive) void checkIdleSeekTarget().catch((error) => {
+if (!legacyTest && !initiallyInactive && !resumeTest) void checkIdleSeekTarget().catch((error) => {
   fixture.errors.push(String(error));
   document.querySelector("#results")!.textContent = JSON.stringify({ passed: 0, failed: 1, error: String(error) });
 });

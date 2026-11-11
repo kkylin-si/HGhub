@@ -47,6 +47,7 @@ type Persist = {
   likes: number[];
   favs: number[];
   history: WatchProgress[];
+  progress: Record<number, WatchProgress>;
   follows: number[];
   muted: boolean;
   muteOnStartup: boolean;
@@ -57,7 +58,7 @@ type Persist = {
 
 const LS = "hghub_app_v1";
 const DEFAULTS: Persist = {
-  likes: [], favs: [], history: [], follows: [],
+  likes: [], favs: [], history: [], progress: {}, follows: [],
   muted: true, muteOnStartup: true, subtitlesEnabled: true, volume: 0.7, searchHist: [],
 };
 
@@ -66,13 +67,16 @@ function normalizeHistory(raw: unknown): WatchProgress[] {
   if (!Array.isArray(raw)) return [];
   const out: WatchProgress[] = [];
   raw.forEach((item, i) => {
-    if (typeof item === "number") {
+    if (typeof item === "number" && Number.isSafeInteger(item) && item > 0) {
       out.push({ id: item, ep: 1, t: 0, dur: 0, at: Date.now() - i });
       return;
     }
     const h = item as Partial<WatchProgress> | null;
-    if (h && typeof h.id === "number") {
-      out.push({ id: h.id, ep: Number(h.ep) || 1, t: Number(h.t) || 0, dur: Number(h.dur) || 0, at: Number(h.at) || Date.now() - i });
+    if (h && typeof h.id === "number" && Number.isSafeInteger(h.id) && h.id > 0) {
+      const ep = Number(h.ep), t = Number(h.t), dur = Number(h.dur), at = Number(h.at);
+      out.push({ id: h.id, ep: Number.isSafeInteger(ep) && ep > 0 ? ep : 1,
+        t: Number.isFinite(t) && t >= 0 ? t : 0, dur: Number.isFinite(dur) && dur >= 0 ? dur : 0,
+        at: Number.isFinite(at) && at > 0 ? at : Date.now() - i });
     }
   });
   return out;
@@ -82,10 +86,19 @@ function loadPersist(): Persist {
   try {
     const raw = localStorage.getItem(LS);
     if (!raw) return DEFAULTS;
-    const p = { ...DEFAULTS, ...(JSON.parse(raw) as Partial<Persist>) };
+    const parsed = JSON.parse(raw) as Partial<Persist>;
+    const p = { ...DEFAULTS, ...parsed };
+    const history = normalizeHistory(p.history);
+    const progress: Record<number, WatchProgress> = {};
+    // Migrate the existing history once. An explicit empty progress map represents a user's clear.
+    const saved = Object.prototype.hasOwnProperty.call(parsed, "progress")
+      ? normalizeHistory(Object.values(p.progress && typeof p.progress === "object" ? p.progress : {})) : history;
+    for (const entry of saved) {
+      if (!progress[entry.id] || progress[entry.id].at < entry.at) progress[entry.id] = entry;
+    }
     // 只在启动时应用；本次使用中取消静音不会关闭此偏好。
     const muteOnStartup = p.muteOnStartup !== false;
-    return { ...p, subtitlesEnabled: p.subtitlesEnabled !== false, muteOnStartup, muted: muteOnStartup || p.muted === true, history: normalizeHistory(p.history) };
+    return { ...p, subtitlesEnabled: p.subtitlesEnabled !== false, muteOnStartup, muted: muteOnStartup || p.muted === true, history: history.slice(0, 80), progress };
   } catch {
     return DEFAULTS;
   }
@@ -116,8 +129,10 @@ type Store = {
   isLiked: (id: number) => boolean; isFav: (id: number) => boolean;
   toggleLikeLocal: (id: number) => boolean;
   toggleFavLocal: (id: number) => boolean;
-  /** 记一条观看记录；`ep/t/dur` 省略时保留原进度，`ep` 变了就把进度归零 */
-  addHistory: (id: number, ep?: number, t?: number, dur?: number) => void;
+  getWatchProgress: (id: number) => WatchProgress | undefined;
+  claimWatchProgress: (id: number) => number;
+  /** Save actual playback. A newer player or a history clear invalidates older writers. */
+  addHistory: (id: number, ep?: number, t?: number, dur?: number, writer?: number) => void;
   clearHistory: () => void;
   toggleFollowLocal: (uid: number) => boolean;
   theater: boolean; setTheater: (v: boolean | ((p: boolean) => boolean)) => void;
@@ -138,7 +153,11 @@ export const useStore = () => useContext(Ctx);
 let seq = 0;
 
 export function AppProvider({ children }: { children: React.ReactNode }) {
-  const [p, setP] = useState<Persist>(loadPersist);
+  const [p, setPersist] = useState<Persist>(loadPersist);
+  const persistRef = useRef(p);
+  const writers = useRef(new Map<number, number>());
+  const writerSeq = useRef(0);
+  const storageFailed = useRef(false);
   const [theme, setThemeState] = useState<Theme>(readTheme);
   const [tab, setTabRaw] = useState<Tab>("home");
   const [stack, setStack] = useState<Page[]>([]);
@@ -158,10 +177,6 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     applyTheme(theme);
     try { localStorage.setItem("hghub_theme", theme); } catch { /* ignore */ }
   }, [theme]);
-
-  useEffect(() => {
-    try { localStorage.setItem(LS, JSON.stringify(p)); } catch { /* ignore */ }
-  }, [p]);
 
   useEffect(() => {
     api.boot()
@@ -194,6 +209,20 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     setToasts((t) => [...t.slice(-2), { id, msg, icon }]);
     window.setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 2200);
   }, []);
+
+  const setP = useCallback((update: (previous: Persist) => Persist) => {
+    const next = update(persistRef.current);
+    persistRef.current = next;
+    // Lifecycle saves must reach storage before pagehide or unmount finishes.
+    try {
+      localStorage.setItem(LS, JSON.stringify(next));
+      storageFailed.current = false;
+    } catch {
+      if (!storageFailed.current) toast("本地记录保存失败，重启后可能丢失本次修改", "info");
+      storageFailed.current = true;
+    }
+    setPersist(next);
+  }, [toast]);
 
   const setTab = useCallback((t: Tab) => { setTabRaw(t); setStack([]); setCleanState(false); }, []);
   const push = useCallback((pg: PageInput) => {
@@ -229,22 +258,31 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     });
     return on;
   }, []);
-  const addHistory = useCallback((id: number, ep?: number, t?: number, dur?: number) => {
-    if (!id) return;
+  const getWatchProgress = useCallback((id: number) => persistRef.current.progress[id], []);
+  const claimWatchProgress = useCallback((id: number) => {
+    const writer = ++writerSeq.current;
+    writers.current.set(id, writer);
+    return writer;
+  }, []);
+  const addHistory = useCallback((id: number, ep?: number, t?: number, dur?: number, writer?: number) => {
+    if (!Number.isSafeInteger(id) || id <= 0 || (writer !== undefined && writers.current.get(id) !== writer)) return;
     setP((s) => {
-      const prev = s.history.find((x) => x.id === id);
+      const prev = s.progress[id];
       const epChanged = ep !== undefined && prev !== undefined && prev.ep !== ep;
       const entry: WatchProgress = {
         id,
         ep: ep ?? prev?.ep ?? 1,
-        t: epChanged ? 0 : (t ?? prev?.t ?? 0),
-        dur: dur ?? prev?.dur ?? 0,
+        t: t ?? (epChanged ? 0 : prev?.t ?? 0),
+        dur: dur ?? (epChanged ? 0 : prev?.dur ?? 0),
         at: Date.now(),
       };
-      return { ...s, history: [entry, ...s.history.filter((x) => x.id !== id)].slice(0, 80) };
+      return { ...s, progress: { ...s.progress, [id]: entry }, history: [entry, ...s.history.filter((x) => x.id !== id)].slice(0, 80) };
     });
-  }, []);
-  const clearHistory = useCallback(() => setP((s) => ({ ...s, history: [] })), []);
+  }, [setP]);
+  const clearHistory = useCallback(() => {
+    writers.current.clear();
+    setP((s) => ({ ...s, history: [], progress: {} }));
+  }, [setP]);
   const addSearch = useCallback((q: string) => {
     const t = q.trim();
     if (!t) return;
@@ -299,7 +337,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     likes: p.likes, favs: p.favs, history: p.history, follows: p.follows,
     isLiked: (id) => p.likes.includes(id),
     isFav: (id) => p.favs.includes(id),
-    toggleLikeLocal, toggleFavLocal, toggleFollowLocal, addHistory, clearHistory,
+    toggleLikeLocal, toggleFavLocal, toggleFollowLocal, getWatchProgress, claimWatchProgress, addHistory, clearHistory,
     muted: p.muted, setMuted, volume: p.volume, setVolume,
     theater, setTheater, fs, setFs, clean, setClean,
     muteOnStartup: p.muteOnStartup, setMuteOnStartup,
@@ -308,7 +346,7 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     strictSecurity, strictSecurityReady, securityPending, cliRelaxed, setStrictSecurity,
     toasts, toast,
   }), [theme, tab, setTab, stack, push, pop, user, loginOpen, logout,
-    p, toggleLikeLocal, toggleFavLocal, toggleFollowLocal, addHistory, clearHistory,
+    p, toggleLikeLocal, toggleFavLocal, toggleFollowLocal, getWatchProgress, claimWatchProgress, addHistory, clearHistory,
     setMuted, setMuteOnStartup, setSubtitlesEnabled, setVolume, addSearch, clearSearchHist, strictSecurity, strictSecurityReady, securityPending, cliRelaxed, setStrictSecurity,
     toasts, toast, theater, setTheater, fs, setFs, clean, setClean]);
 
