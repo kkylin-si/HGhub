@@ -404,7 +404,11 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
           reportSizeAndDuration(e.target as HTMLVideoElement);
           if (activity.isActive()) onPlaying?.();
         }}
-        onSeeking={() => onWaiting?.()}
+        onSeeking={(e) => {
+          const video = e.currentTarget;
+          if (video.currentTime < video.duration - Math.min(1.5, video.duration / 2)) nearEndFiredRef.current = false;
+          onWaiting?.();
+        }}
         onSeeked={() => {
           const v = videoRef.current;
           if (v && !v.paused && activity.isActive()) onPlaying?.();

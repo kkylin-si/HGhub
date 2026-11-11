@@ -41,6 +41,8 @@ export function useWatchProgress({ id, active, videoRef, startEp, startTime }: {
     if (!video || video.readyState < 2 || video.seeking || s.resume !== null) return;
     if (Number.isFinite(video.duration) && video.duration > 0) s.duration = video.duration;
     if (Number.isFinite(video.currentTime)) s.time = Math.max(0, video.currentTime);
+    // VideoSurface 可在片尾 1.5 秒内提前报结束，回拖离开此区间后才清除完成标记。
+    if (s.ended && !video.ended && s.time < s.duration - Math.min(1.5, s.duration / 2)) s.ended = false;
   };
   const save = (s: Session) => {
     if (s.writer === undefined || s.resume !== null) return;

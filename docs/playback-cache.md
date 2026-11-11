@@ -12,4 +12,4 @@
 
 清单与视频分片采用不同有效期：已结束点播主清单缓存 5 分钟，其余主清单 2 秒；子清单不进入分片内存缓存，协议层不缓存清单。启用磁盘缓存时分片响应不再由 WebView 单独长期缓存，以便读取更新 LRU 和清理状态。磁盘索引的访问时间和部分块范围在运行中即时更新，索引约每 5 秒合并保存，并在分配块和完成整个块时保存。异常退出后，尚未保存到索引的部分范围可能再次下载。
 
-验证入口：`pnpm test:cache` 覆盖队列、依赖、取消、容量变化和 EOF；`pnpm test:playback --media-dir DIR` 验证真实浏览器播放与时间轴。允许回环监听后运行 `cargo test --offline --locked --lib local_server -- --ignored --test-threads=1`，用本地 HTTP 验证双向补齐、已收范围复用、在途下载接管、取消、ETag 隔离和动态清单。原生 iOS/macOS 播放仍需实机验证；这些自动测试不等同于原生播放器实测。
+验证入口：`pnpm test:cache` 覆盖队列、依赖、取消、容量变化和 EOF；`pnpm test:playback --scenarios cache-resume,mp4-cache` 将真实浏览器接入测试 HTTP 桥，验证 Rust 磁盘缓存下的 HLS 续播与 MP4 解码、跳转和复用。运行条件和完整场景见 [播放回归说明](playback-diagnostics.md)。在 `src-tauri` 下运行 `cargo test --offline --locked --lib`，覆盖部分块落盘失败、索引恢复、容量淘汰和共享任务清理；允许回环监听后运行 `cargo test --offline --locked --lib local_server -- --ignored --test-threads=1`，用本地 HTTP 验证双向补齐、已收范围复用、在途下载接管、下载中清理/关闭/缩容、ETag 隔离和动态清单。原生 iOS/macOS 播放仍需实机验证；这些自动测试不等同于原生播放器实测。

@@ -13,7 +13,9 @@ import Profile from "../src/pages/Profile";
 import Search from "../src/pages/Search";
 
 // 仅将自定义媒体协议映射到本地测试服务器；播放器、HLS 和鼠标事件均使用真实实现。
-const proxy = new URLSearchParams(location.search).get("proxy") || "http://127.0.0.1:17779";
+const proxy = new URLSearchParams(location.search).get("backend") || new URLSearchParams(location.search).get("proxy") || "http://127.0.0.1:17779";
+const backend = new URLSearchParams(location.search).get("backend");
+const upstream = new URLSearchParams(location.search).get("upstream");
 const open = XMLHttpRequest.prototype.open;
 XMLHttpRequest.prototype.open = function (this: XMLHttpRequest, method: string, target: string | URL, async: boolean = true, user?: string | null, credential?: string | null) {
   const url = new URL(String(target), location.href);
@@ -62,7 +64,10 @@ const legacyTest = new URLSearchParams(location.search).has("legacy");
 const initiallyInactive = new URLSearchParams(location.search).has("inactive");
 const subtitleHls = new URLSearchParams(location.search).has("subtitle_hls");
 const resumeTest = new URLSearchParams(location.search).has("resume");
-const mediaSource = () => `https://media.fixture.invalid/${subtitleHls ? "master" : "list"}.m3u8${fixture.sourceKey ? `?source=${fixture.sourceKey}` : ""}`;
+const mixedDuration = new URLSearchParams(location.search).has("mixed");
+const directTest = new URLSearchParams(location.search).has("direct");
+const mediaSource = () => backend ? `${upstream}/vod/${directTest ? 'video.mp4' : 'list.m3u8'}`
+  : `https://media.fixture.invalid/${subtitleHls ? "master" : "list"}.m3u8${fixture.sourceKey ? `?source=${fixture.sourceKey}` : ""}`;
 if (diagnosticTest) {
   // Test-only handle: exercise the real engine's public API without rewriting production modules.
   const attach = Hls.prototype.attachMedia;
@@ -117,12 +122,36 @@ if (cacheSeekTest) {
     return true;
   };
 }
+if (backend) {
+  const command = async <T,>(name: string, args: object = {}): Promise<T> => {
+    const response = await fetch(`${backend}/api/${name}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(args) });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error);
+    return result;
+  };
+  api.playbackCacheStatus = () => command('status');
+  api.playbackCacheSet = async maxMib => { await command('set', { maxMib }); window.dispatchEvent(new Event('playback-cache-change')); };
+  api.playbackCacheStart = sessionId => command('start', { sessionId });
+  api.playbackCacheStop = sessionId => command('stop', { sessionId });
+  api.playbackCacheReady = (sessionId, ready) => command('ready', { sessionId, ready });
+  api.playbackCacheContains = urls => command('contains', { urls });
+  api.playbackCachePrefetch = async (url, protectedUrls, sessionId, range, validator, focus) => {
+    const saved = await command<boolean>('prefetch', { url, protectedUrls, sessionId, range, validator, focus });
+    if (saved) fixture.cacheWrites.push({ url, time: document.querySelector('video')?.currentTime ?? 0 });
+    return saved;
+  };
+  api.playbackCacheObserved = urls => command('observed', { urls });
+  api.playbackCacheProbe = (url, sessionId) => command('probe', { url, sessionId });
+  api.playbackCacheCursor = url => command('cursor', { url });
+  api.playbackCachePending = url => command('pending', { url });
+  api.clearCache = async () => { await command('clear'); window.dispatchEvent(new Event('playback-cache-change')); };
+}
 api.boot = async () => ({ user: null, logged_in: false, base: "https://fixture.invalid", strict_security: true });
 api.play = async (id, ep = 1) => {
   fixture.playRequests.push({ id, ep });
   if (fixture.failEpisode === ep) throw new Error("Fixture episode unavailable");
   return { id, ep_num: ep, title: "Seek fixture", duration: 90,
-    video_url: mediaSource() + (resumeTest ? `?video=${id}&episode=${ep}` : "") };
+    video_url: mediaSource() + (resumeTest ? `?video=${id}&episode=${ep}${mixedDuration && ep === 2 ? '&short=1' : ''}` : "") };
 };
 api.video = async (id) => ({
   id, title: resumeTest ? `续播视频 ${id}` : "Seek fixture", description: "", cover: "", tags: [], score: 0,

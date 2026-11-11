@@ -9,6 +9,8 @@ mod media_download;
 mod net;
 mod network_policy;
 mod playback_log;
+#[cfg(test)]
+mod playback_test_server;
 mod session;
 
 use api::Api;

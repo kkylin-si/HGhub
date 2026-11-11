@@ -834,6 +834,7 @@ mod tests {
         held: Arc<(Mutex<bool>, std::sync::Condvar)>,
         changed: Arc<std::sync::atomic::AtomicBool>,
         peak: Arc<AtomicU64>,
+        paused: Arc<AtomicU64>,
         stopped: Arc<std::sync::atomic::AtomicBool>,
         thread: Option<std::thread::JoinHandle<()>>,
     }
@@ -848,8 +849,9 @@ mod tests {
             let changed = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let peak = Arc::new(AtomicU64::new(0));
+            let paused = Arc::new(AtomicU64::new(0));
             let active = Arc::new(AtomicU64::new(0));
-            let mut server = Self { origin, requests: requests.clone(), held: held.clone(), changed: changed.clone(), peak: peak.clone(), stopped: stopped.clone(), thread: None };
+            let mut server = Self { origin, requests: requests.clone(), held: held.clone(), changed: changed.clone(), peak: peak.clone(), paused: paused.clone(), stopped: stopped.clone(), thread: None };
             server.thread = Some(std::thread::spawn(move || {
                 let mut workers = Vec::new();
                 while !stopped.load(Ordering::SeqCst) {
@@ -858,7 +860,7 @@ mod tests {
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => { std::thread::sleep(std::time::Duration::from_millis(1)); continue; }
                         Err(error) => panic!("{error}"),
                     };
-                    let requests = requests.clone(); let held = held.clone(); let changed = changed.clone(); let active = active.clone(); let peak = peak.clone();
+                    let requests = requests.clone(); let held = held.clone(); let changed = changed.clone(); let active = active.clone(); let peak = peak.clone(); let paused = paused.clone();
                     workers.push(std::thread::spawn(move || {
                         stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
                         let mut request = Vec::new();
@@ -885,7 +887,14 @@ mod tests {
                             std::thread::sleep(std::time::Duration::from_millis(3));
                             let header = format!("HTTP/1.1 206 Partial Content\r\nContent-Type: video/mp4\r\nContent-Range: bytes {}-{}/{}\r\nETag: \"{etag}\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", range.start, range.end, 2 * DIRECT_BLOCK, body.len());
                             let payload = if path.contains("truncated") { &body[..body.len() - 1] } else { &body[..] };
-                            let _ = stream.write_all(header.as_bytes()).and_then(|_| stream.write_all(payload));
+                            if path.starts_with("/slow") && range.start >= DIRECT_TRANSFER {
+                                let half = payload.len() / 2;
+                                let _ = stream.write_all(header.as_bytes()).and_then(|_| stream.write_all(&payload[..half]));
+                                paused.fetch_add(1, Ordering::SeqCst);
+                                let mut hold = held.0.lock().unwrap();
+                                while *hold { hold = held.1.wait(hold).unwrap(); }
+                                let _ = stream.write_all(&payload[half..]);
+                            } else { let _ = stream.write_all(header.as_bytes()).and_then(|_| stream.write_all(payload)); }
                         }
                         active.fetch_sub(1, Ordering::SeqCst);
                     }));
@@ -895,6 +904,59 @@ mod tests {
             server
         }
         fn release(&self) { *self.held.0.lock().unwrap() = false; self.held.1.notify_all(); }
+    }
+
+    #[tokio::test]
+    #[ignore = "local HTTP integration test; run with loopback access"]
+    async fn inflight_cache_changes_local_server() {
+        let _test_guard = crate::media_cache::TEST_LOCK.lock().unwrap();
+        let server = CacheServer::start();
+        let dir = std::env::temp_dir().join(format!("hghub-inflight-{}-{}", std::process::id(), DIRECT_REQUEST_ID.fetch_add(1, Ordering::Relaxed)));
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::network_policy::bind_security(&dir);
+        crate::network_policy::set_strict_security(false).unwrap();
+        crate::media_cache::bind(&dir);
+        for action in ["clear", "disable", "shrink"] {
+            crate::media_cache::set_limit(256).unwrap();
+            crate::media_cache::clear().unwrap();
+            *server.held.0.lock().unwrap() = true;
+            let paused = server.paused.load(Ordering::SeqCst);
+            let url = format!("{}/slow-{action}.mp4", server.origin);
+            let (_, tag) = probe_direct(&url, true).await.unwrap();
+            let block = ByteRange { start: 0, end: DIRECT_BLOCK - 1 };
+            let key = direct_cache_key(&url, block, &tag);
+            let session_id = format!("inflight-{action}");
+            crate::media_cache::start_session(session_id.clone()).unwrap();
+            let background_url = url.clone(); let background_tag = tag.clone(); let background_id = session_id.clone();
+            let background = tokio::spawn(async move { crate::api::playback_cache_prefetch(background_url, Some(block), Some(background_tag), vec![], background_id, None).await });
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                while server.paused.load(Ordering::SeqCst) == paused { tokio::time::sleep(std::time::Duration::from_millis(2)).await; }
+            }).await.unwrap();
+            assert!(crate::media_cache::read_range(&key, 0, DIRECT_TRANSFER - 1).is_some());
+            let foreground_url = url.clone();
+            let foreground = tokio::spawn(async move { range_response(&foreground_url, "bytes=65536-131071", true).await });
+            tokio::task::yield_now().await;
+            match action {
+                "clear" => crate::api::cache_clear().await.unwrap(),
+                "disable" => crate::media_cache::set_limit(0).unwrap(),
+                _ => crate::media_cache::set_limit(128).unwrap(),
+            }
+            assert!(!tokio::time::timeout(std::time::Duration::from_secs(1), background).await.unwrap().unwrap().unwrap());
+            assert!(crate::media_cache::session(&session_id).is_none());
+            assert_eq!(crate::media_cache::PREFETCH_SLOT.available_permits(), 2);
+            server.release();
+            let response = tokio::time::timeout(std::time::Duration::from_secs(3), foreground).await.unwrap().unwrap();
+            assert_eq!(response.status(), 206, "foreground playback must survive a cache setting change");
+            assert_eq!(response.body(), &(DIRECT_TRANSFER..2 * DIRECT_TRANSFER).map(|offset| (offset % 251) as u8).collect::<Vec<_>>());
+            assert!(crate::media_cache::read_range(&key, DIRECT_TRANSFER, 2 * DIRECT_TRANSFER - 1).is_none(), "the old transfer wrote into the new cache generation");
+            if action != "shrink" { assert_eq!(crate::media_cache::status().1, 0); }
+            else { assert!(crate::media_cache::status().1 <= 128 * 1024 * 1024); }
+            crate::media_cache::set_limit(128).unwrap();
+            assert!(prefetch_segment(&url, Some(block), Some(&tag), &[], None).await.unwrap(), "a fresh transfer could not resume caching");
+            assert!(crate::media_cache::contains(&key));
+        }
+        crate::media_cache::clear().unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
     }
     impl Drop for CacheServer {
         fn drop(&mut self) {

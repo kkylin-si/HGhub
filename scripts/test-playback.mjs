@@ -1,4 +1,4 @@
-// Local-only headless playback checks. No upstream APIs, credentials or Tauri IPC are used.
+// Local-only headless playback checks. Integrated cache cases call Rust through a test-only HTTP bridge.
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createServer as createHttpServer } from "node:http";
@@ -10,41 +10,61 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { chromium } from "playwright-core";
 import { createServer as createViteServer } from "vite";
+import { checks as regressionChecks } from "./playback-regressions.mjs";
+import { startBackend } from "./playback-backend.mjs";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const { values: args } = parseArgs({ options: {
   "media-dir": { type: "string" }, output: { type: "string" }, "browser-executable": { type: "string" },
-  scenarios: { type: "string", default: "seek,legacy,stall,lifecycle,mms,subtitles,subtitles-legacy,subtitles-hls,resume,progress" }, help: { type: "boolean" },
+  scenarios: { type: "string", default: `seek,legacy,stall,lifecycle,mms,subtitles,subtitles-legacy,subtitles-hls,resume,progress,${Object.keys(regressionChecks).join(',')}` }, help: { type: "boolean" },
 } });
 if (args.help) {
-  console.log("pnpm test:playback [--media-dir DIR] [--output NEW_DIR] [--browser-executable PATH] [--scenarios seek,legacy,stall,lifecycle,mms,subtitles,subtitles-legacy,subtitles-hls,resume,progress]");
+  console.log(`pnpm test:playback [--media-dir DIR] [--output NEW_DIR] [--browser-executable PATH] [--scenarios seek,legacy,stall,lifecycle,mms,subtitles,subtitles-legacy,subtitles-hls,resume,progress,${Object.keys(regressionChecks).join(',')}]`);
   process.exit(0);
 }
 const scenarios = args.scenarios.split(",");
-assert(scenarios.length && scenarios.every(s => ["seek", "legacy", "stall", "lifecycle", "mms", "subtitles", "subtitles-legacy", "subtitles-hls", "resume", "progress"].includes(s)), "Unknown scenario");
+assert(scenarios.length && scenarios.every(s => ["seek", "legacy", "stall", "lifecycle", "mms", "subtitles", "subtitles-legacy", "subtitles-hls", "resume", "progress", ...Object.keys(regressionChecks)].includes(s)), "Unknown scenario");
 const output = resolve(args.output || join(root, "test-results", "playback", new Date().toISOString().replace(/[:.]/g, "-")));
 await mkdir(dirname(output), { recursive: true });
 await mkdir(output); // Refuse to overwrite artifacts from an earlier run.
 const jsonl = (file, entry) => appendFileSync(file, JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n");
 const report = { started: new Date().toISOString(), platform: process.platform, browser: "chromium", transport: "browser fixture; not Tauri/WKWebView", output, cases: [] };
-let temporaryMedia, vite, media, browser;
+let temporaryMedia, vite, media, browser, backend;
+const mediaRequests = [];
 let nextRequest = 0;
 const requests = new Set();
 
-async function serveMedia(dir) {
+async function serveMedia(dir, mp4) {
   const manifest = await readFile(join(dir, "list.m3u8"), "utf8");
   assert(manifest.startsWith("#EXTM3U") && manifest.includes("#EXT-X-ENDLIST"), "Expected a local VOD HLS fixture");
   const server = createHttpServer(async (req, res) => {
     const started = performance.now(), request = ++nextRequest;
     const url = new URL(req.url, "http://localhost");
     let status = 200, bytes = 0, fragment;
-    res.on("close", () => jsonl(join(output, "media-server.jsonl"), { request, route: url.pathname, fragment, status, bytes, elapsed_ms: Math.round(performance.now() - started), aborted: !res.writableFinished }));
+    res.on("close", () => {
+      const record = { request, route: url.pathname, resource: `${url.pathname}${url.search}`, fragment, range: req.headers.range, status, bytes, elapsed_ms: Math.round(performance.now() - started), aborted: !res.writableFinished };
+      mediaRequests.push(record); jsonl(join(output, "media-server.jsonl"), record);
+    });
     try {
       let body, kind;
       const target = new URL(url.searchParams.get("u") || "https://media.fixture.invalid/list.m3u8");
       const proxied = file => `http://hg.localhost/seg?u=${encodeURIComponent(`https://media.fixture.invalid/${file}`)}`;
-      const rewritten = () => Buffer.from(manifest.split("\n").map(line => !line || line.startsWith("#") ? line : proxied(line.trim())).join("\n"));
-      if (url.pathname === "/hls") {
+      const selected = target.searchParams.has('short') ? manifest.split(/(?=#EXTINF:)/).slice(0, 16).join('') + '#EXT-X-ENDLIST\n' : manifest;
+      const rewritten = () => Buffer.from(selected.split("\n").map(line => !line || line.startsWith("#") ? line : proxied(line.trim())).join("\n"));
+      if (url.pathname === '/vod/list.m3u8') {
+        body = Buffer.from(manifest); kind = 'application/vnd.apple.mpegurl';
+      } else if (/^\/vod\/seg\d+\.ts$/.test(url.pathname)) {
+        fragment = basename(url.pathname); body = await readFile(join(dir, fragment)); kind = 'video/mp2t';
+        await new Promise(resolve => setTimeout(resolve, 15));
+      } else if (url.pathname === '/vod/video.mp4' && mp4) {
+        const range = req.headers.range?.match(/^bytes=(\d+)-(\d*)$/);
+        const start = range ? Number(range[1]) : 0, end = range?.[2] ? Math.min(Number(range[2]), mp4.length - 1) : mp4.length - 1;
+        if (start > end || start >= mp4.length) { res.writeHead(416); res.end(); return; }
+        body = mp4.subarray(start, end + 1); kind = 'video/mp4'; status = range ? 206 : 200;
+        res.setHeader('ETag', '"fixture-v1"'); res.setHeader('Accept-Ranges', 'bytes');
+        if (range) res.setHeader('Content-Range', `bytes ${start}-${end}/${mp4.length}`);
+        await new Promise(resolve => setTimeout(resolve, 8));
+      } else if (url.pathname === "/hls") {
         body = target.pathname.endsWith("master.m3u8")
           ? Buffer.from(`#EXTM3U\n#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="text",NAME="Chinese",LANGUAGE="zh",DEFAULT=YES,AUTOSELECT=YES,URI="${proxied('subs.m3u8')}"\n#EXT-X-STREAM-INF:BANDWIDTH=1000000,SUBTITLES="text"\n${proxied('list.m3u8')}\n`)
           : rewritten();
@@ -357,7 +377,7 @@ async function lifecycleCheck(page) {
   return { feed, legacy, late_mount_paused: true };
 }
 
-async function loadResumeFixture(page) {
+async function loadResumeFixture(page, extra = '') {
   await page.addInitScript(() => {
     if (sessionStorage.getItem('progress-fixture-seeded')) return;
     sessionStorage.setItem('progress-fixture-seeded', '1');
@@ -367,7 +387,7 @@ async function loadResumeFixture(page) {
       { id: 992, ep: 4, t: 22, dur: 90, at: Date.now() - 1 },
     ] }));
   });
-  await page.goto(`${report.ui}/tests/player-seek.html?diagnostics=1&resume=1&proxy=${encodeURIComponent(report.media)}`);
+  await page.goto(`${report.ui}/tests/player-seek.html?diagnostics=1&resume=1&proxy=${encodeURIComponent(report.media)}${extra}`);
   await page.getByRole('region', { name: 'AI成人短剧', exact: true }).getByText('续播视频 991', { exact: true }).waitFor();
 }
 const openCategoryVideo = page => page.getByRole('region', { name: 'AI成人短剧', exact: true }).getByRole('button', { name: /续播视频 991/ }).click();
@@ -533,12 +553,22 @@ try {
   }
   vite = await createViteServer({ root, server: { host: "127.0.0.1", port: 0, strictPort: false, hmr: false, open: false } });
   await vite.listen(); report.ui = `http://127.0.0.1:${vite.httpServer.address().port}`;
-  media = await serveMedia(mediaDir); report.media = `http://127.0.0.1:${media.address().port}`;
+  let mp4;
+  if (scenarios.includes('mp4-cache')) {
+    const target = join(output, 'fixture.mp4');
+    execFileSync(process.env.FFMPEG_PATH || 'ffmpeg', ['-hide_banner', '-loglevel', 'error', '-i', join(mediaDir, 'list.m3u8'), '-c', 'copy', '-movflags', '+faststart', target], { timeout: 60000, stdio: 'pipe' });
+    mp4 = await readFile(target); report.mp4_bytes = mp4.length;
+  }
+  media = await serveMedia(mediaDir, mp4); report.media = `http://127.0.0.1:${media.address().port}`;
+  if (scenarios.some(name => ['cache-resume', 'mp4-cache'].includes(name))) backend = await startBackend(root);
   browser = await chromium.launch({ headless: true, executablePath: args["browser-executable"], args: ["--autoplay-policy=no-user-gesture-required"] });
   report.browser_version = browser.version();
   for (const name of scenarios) {
     const dir = join(output, name); await mkdir(dir);
-    const context = await browser.newContext({ viewport: { width: 1000, height: 900 } });
+    const integrated = ['cache-resume', 'mp4-cache'].includes(name);
+    if (integrated) { await backend.command('set', { maxMib: 256 }); await backend.command('clear'); }
+    const context = await browser.newContext({ viewport: { width: 1000, height: 900 },
+      ...(integrated ? { userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36' } : {}) });
     await context.exposeBinding("collectPlaybackLogs", (_source, entries) => {
       for (const e of entries) jsonl(join(dir, "playback.jsonl"), { ts: e.data.at, event: `web.${e.event}`, data: e.data, transport: "browser-fixture" });
     });
@@ -546,9 +576,13 @@ try {
     const page = await context.newPage(), pageErrors = [], externalRequests = [];
     page.setDefaultTimeout(15000);
     // Nothing in these tests should contact an upstream service.
-    await context.route("**/*", route => {
+    await context.route("**/*", async route => {
       const url = new URL(route.request().url());
-      if ([report.ui, report.media].includes(url.origin)) return route.continue();
+      if (integrated && url.hostname === 'hg.localhost') {
+        const response = await route.fetch({ url: `${backend.origin}${url.pathname}${url.search}` });
+        return route.fulfill({ response });
+      }
+      if ([report.ui, report.media, backend?.origin].includes(url.origin)) return route.continue();
       externalRequests.push({ protocol: url.protocol, host: url.hostname }); return route.abort("blockedbyclient");
     });
     const ids = new WeakMap(); let requestId = 0;
@@ -560,7 +594,7 @@ try {
     const result = { name, status: "running", started: new Date().toISOString() }; report.cases.push(result);
     let deadline;
     try {
-      const action = name === "resume" ? resumeChecks(page) : name === "progress" ? progressChecks(page) : name === "subtitles-hls" ? hlsSubtitleChecks(page) : name.startsWith("subtitles") ? subtitleChecks(page, name === "subtitles-legacy") : name === "seek" || name === "legacy" ? seekChecks(page, name === "legacy") : name === "stall" ? stallCheck(page) : name === "mms" ? managedMediaCheck(page) : lifecycleCheck(page);
+      const action = regressionChecks[name] ? regressionChecks[name](page, { report, backend, mediaRequests, loadResumeFixture, openCategoryVideo, expectPlayback, backFromPlayer, pickEpisode, clickProgress }) : name === "resume" ? resumeChecks(page) : name === "progress" ? progressChecks(page) : name === "subtitles-hls" ? hlsSubtitleChecks(page) : name.startsWith("subtitles") ? subtitleChecks(page, name === "subtitles-legacy") : name === "seek" || name === "legacy" ? seekChecks(page, name === "legacy") : name === "stall" ? stallCheck(page) : name === "mms" ? managedMediaCheck(page) : lifecycleCheck(page);
       result.metrics = await Promise.race([action, new Promise((_, reject) => { deadline = setTimeout(() => reject(new Error("Scenario exceeded 45 seconds")), 45000); })]);
       assert.deepEqual(pageErrors, [], "Browser script errors");
       assert.deepEqual(externalRequests, [], "Unexpected external network requests");
@@ -583,6 +617,7 @@ try {
   report.setup_error = error.message; console.error(error.message);
 } finally {
   await browser?.close();
+  if (backend) await backend.stop().catch(error => { report.backend_error = error.message; report.setup_error = error.message; });
   for (const socket of requests) socket.destroy();
   if (media) await new Promise(done => media.close(done));
   await vite?.close();

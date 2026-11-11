@@ -263,6 +263,61 @@ pub fn partial_blocks(group: &str) -> Vec<(u64, u64)> {
 mod tests {
     use super::*;
     #[test]
+    fn partial_checkpoint_failure_and_restart_never_expose_unrecorded_ranges() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("hghub-partial-failure-{}-{}", std::process::id(), now()));
+        bind(&dir);
+        let generation = generation().unwrap();
+        let blocked = dir.join("playback-cache").join(key("blocked"));
+        std::fs::create_dir(&blocked).unwrap();
+        assert!(!write_range("blocked", "file", 0, 8, 3, b"34567", None, 8, generation, &[]));
+        assert_eq!(status().1, 0);
+        std::fs::remove_dir(blocked).unwrap();
+        assert!(write_range("block", "file", 0, 8, 3, b"34567", None, 8, generation, &[]));
+        // Only allocation has reached index.json. Existing bytes in a sparse file are not coverage.
+        bind(&dir);
+        assert!(read_range("block", 3, 7).is_none());
+        assert!(!contains("block"));
+        assert!(write_range("block", "file", 0, 8, 3, b"34567", None, 8, generation, &[]));
+        save(STORE.lock().unwrap().as_mut().unwrap()).unwrap();
+        let temporary_index = dir.join("playback-cache/index.tmp");
+        std::fs::create_dir(&temporary_index).unwrap();
+        assert!(!write_range("block", "file", 0, 8, 0, b"012", None, 8, generation, &[]));
+        std::fs::remove_dir(temporary_index).unwrap();
+        bind(&dir);
+        assert!(!contains("block"));
+        assert!(read_range("block", 0, 7).is_none());
+        assert_eq!(read_range("block", 3, 7).unwrap().2, b"34567");
+        assert!(write_range("block", "file", 0, 8, 0, b"012", None, 8, generation, &[]));
+        bind(&dir);
+        assert_eq!(get("block").unwrap().1, b"01234567");
+        clear().unwrap(); *STORE.lock().unwrap() = None;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn allocating_a_partial_block_evicts_old_data_and_preserves_protected_data() {
+        let _lock = TEST_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("hghub-partial-quota-{}-{}", std::process::id(), now()));
+        bind(&dir); set_limit(128).unwrap();
+        {
+            let mut guard = STORE.lock().unwrap(); let store = guard.as_mut().unwrap();
+            for (url, accessed) in [("old", 1), ("upcoming", 2)] {
+                let id = key(url);
+                std::fs::File::create(store.root.join(&id)).unwrap().set_len(64 * 1024 * 1024).unwrap();
+                store.index.entries.insert(id, Entry { size: 64 * 1024 * 1024, accessed, mime: None, total: None, partial: None });
+            }
+        }
+        assert!(write_range("partial", "file", 0, 1024 * 1024, 500_000, b"tail", None, 1024 * 1024, generation().unwrap(), &["upcoming".into()]));
+        assert!(!contains("old") && contains("upcoming"));
+        assert!(!contains("partial"));
+        assert_eq!(status().1, 65 * 1024 * 1024);
+        assert_eq!(read_range("partial", 500_000, 500_003).unwrap().2, b"tail");
+        set_limit(0).unwrap(); assert_eq!(status().1, 0);
+        *STORE.lock().unwrap() = None; std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn partial_blocks_merge_reopen_and_count_against_the_limit() {
         let _lock = TEST_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join(format!("hghub-partial-{}-{}", std::process::id(), now()));

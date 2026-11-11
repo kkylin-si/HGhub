@@ -163,4 +163,54 @@ mod tests {
         let result = tokio::time::timeout(std::time::Duration::from_secs(1), player).await.unwrap().unwrap().unwrap();
         assert_eq!(result.bytes.as_slice(), b"shared");
     }
+
+    #[tokio::test]
+    async fn an_inflight_background_read_resumes_after_foreground_work() {
+        let _lock = crate::media_cache::TEST_LOCK.lock().unwrap();
+        let (send, mut receive) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (first, received_first) = tokio::sync::oneshot::channel();
+        let mut background = tokio::spawn(shared("pause-body-test".into(), false, move |transfer| async move {
+            let mut bytes = transfer.run(receive.recv()).await.ok_or("fixture closed")?;
+            first.send(()).unwrap();
+            bytes.extend(transfer.run(receive.recv()).await.ok_or("fixture closed")?);
+            Ok(Object { bytes: Arc::new(bytes), ..object() })
+        }));
+        send.send(b"first".to_vec()).unwrap();
+        received_first.await.unwrap();
+        let foreground = foreground();
+        send.send(b"second".to_vec()).unwrap();
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(25), &mut background).await.is_err(), "background body advanced during foreground work");
+        drop(foreground);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), background).await.unwrap().unwrap().unwrap();
+        assert_eq!(result.bytes.as_slice(), b"firstsecond");
+    }
+
+    #[tokio::test]
+    async fn no_consumers_cancel_the_transfer_and_release_its_key() {
+        struct Cancelled(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for Cancelled { fn drop(&mut self) { let _ = self.0.take().unwrap().send(()); } }
+        let _lock = crate::media_cache::TEST_LOCK.lock().unwrap();
+        let (started, started_receive) = tokio::sync::oneshot::channel();
+        let (cancelled, cancelled_receive) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(shared("all-cancelled-test".into(), false, move |transfer| async move {
+            let _cancelled = Cancelled(Some(cancelled));
+            started.send(()).unwrap();
+            transfer.run(std::future::pending::<()>()).await;
+            Ok(object())
+        }));
+        started_receive.await.unwrap();
+        task.abort(); let _ = task.await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), cancelled_receive).await.unwrap().unwrap();
+        tokio::task::yield_now().await;
+        assert!(!TRANSFERS.lock().unwrap().contains_key("all-cancelled-test"));
+        assert_eq!(shared("all-cancelled-test".into(), true, |_| async { Ok(object()) }).await.unwrap().bytes.as_slice(), b"shared");
+    }
+
+    #[tokio::test]
+    async fn a_failed_shared_transfer_can_be_retried_immediately() {
+        let _lock = crate::media_cache::TEST_LOCK.lock().unwrap();
+        assert!(shared("failed-transfer-test".into(), true, |_| async { Err("HTTP 503".into()) }).await.is_err());
+        assert_eq!(shared("failed-transfer-test".into(), true, |_| async { Ok(object()) }).await.unwrap().bytes.as_slice(), b"shared");
+        assert_eq!(SCHEDULER.borrow().foreground, 0);
+    }
 }
