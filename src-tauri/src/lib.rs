@@ -47,6 +47,39 @@ fn allowed_frontend_origin(origin: &str) -> bool {
         })
 }
 
+fn allowed_navigation(url: &url::Url, strict: bool) -> bool {
+    if !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    // "null" is needed for media CORS on opaque WebView origins, but must
+    // never authorize navigation to data:, file:, javascript: or other schemes.
+    match url.scheme() {
+        "tauri" => url.host_str() == Some("localhost"),
+        "http" | "https" => {
+            !strict || allowed_frontend_origin(&url.origin().ascii_serialization())
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod navigation_tests {
+    #[test]
+    fn opaque_media_origins_do_not_authorize_navigation() {
+        for raw in ["data:text/html,<script>alert(1)</script>", "file:///etc/passwd", "javascript:alert(1)", "tauri://evil/index.html", "about:blank"] {
+            let url = url::Url::parse(raw).unwrap();
+            assert!(!super::allowed_navigation(&url, true), "{raw}");
+            assert!(!super::allowed_navigation(&url, false), "{raw}");
+        }
+        for raw in ["tauri://localhost/index.html", "http://tauri.localhost/index.html", "https://tauri.localhost/"] {
+            assert!(super::allowed_navigation(&url::Url::parse(raw).unwrap(), true), "{raw}");
+        }
+        let external = url::Url::parse("https://example.com/").unwrap();
+        assert!(!super::allowed_navigation(&external, true));
+        assert!(super::allowed_navigation(&external, false));
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -74,10 +107,7 @@ pub fn run() {
         .plugin(
             tauri::plugin::Builder::<_, ()>::new("navigation-guard")
                 .on_navigation(|_webview, url| {
-                    (url.scheme() == "tauri" && url.host_str() == Some("localhost"))
-                        || allowed_frontend_origin(&url.origin().ascii_serialization())
-                        || (!network_policy::strict_security()
-                            && matches!(url.scheme(), "http" | "https"))
+                    allowed_navigation(url, network_policy::strict_security())
                 })
                 .build(),
         )

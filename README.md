@@ -46,6 +46,8 @@ HGhub 起源于个人对 Tauri 2 和移动端开发的学习与尝试。感谢�
 ```text
 src/                    界面、交互、状态管理与组件
 src-tauri/              原生能力与 Rust 实现
+native/android/         Kotlin / Compose 原生 Android 客户端
+native/ios/             SwiftUI 原生 iOS 客户端
 scripts/                开发、构建与验证脚本
 tests/                  本地测试页面与回归用例
 docs/                   技术说明与维护记录
@@ -67,6 +69,8 @@ pnpm build           # 类型检查与前端构建
 - exFAT 等不支持符号链接的文件系统需保留 `.npmrc` 中的 `node-linker=hoisted`；部分原生构建步骤仍可能受文件系统限制。
 - 依赖安装脚本的允许列表见 `package.json` 与 `pnpm-workspace.yaml`。
 - 内容处理、网络安全边界与本地回归说明见[客户端内容与网络安全](docs/security.md)。
+- 原生 Android 使用 JDK 17 和 Android SDK 36，在 `native/android` 执行 `sh ./gradlew :app:assembleDebug :app:testDebugUnitTest`；原生 iOS 使用 macOS/Xcode 打开 `native/ios/HGhub.xcodeproj`。原生移动端与 Tauri 客户端分别维护版本号。
+- PR 和合并队列的自动检查见 `.github/workflows/checks.yml`，覆盖桌面构建、安全与播放回归、原生 Android 编译/测试、iOS 模拟器编译/测试，不需要发布签名密钥。上游同步与安全审查记录见 [2026-11-11 审查报告](docs/upstream-audit-20261111.md)。
 
 ## 许可证
 
