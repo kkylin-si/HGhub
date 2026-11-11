@@ -20,11 +20,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v5
         with:
           version: 10
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: pnpm
@@ -47,7 +47,7 @@ jobs:
       - run: pnpm test:security
       - run: pnpm test:api-loading
       - run: pnpm test:playback
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         if: failure()
         with:
           name: local-regression-diagnostics
@@ -59,16 +59,16 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Verify Gradle wrapper before executing it
         run: echo '2db75c40782f5e8ba1fc278a5574bab070adccb2d21ca5a6e5ed840888448046  native/android/gradle/wrapper/gradle-wrapper.jar' | sha256sum --check
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
-      - uses: android-actions/setup-android@v3
+      - uses: android-actions/setup-android@v4
         with:
-          # Override the action's default, which includes the retired "tools" package.
+          # Keep the package list explicit; the retired "tools" package must not be installed.
           packages: platform-tools
       - run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0'
       - name: Build without release signing credentials and run tests
@@ -80,7 +80,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - run: python3 native/ios/tests/test_proxy_disconnect.py
       - run: python3 native/ios/tests/test_security.py
       - name: Compile iOS simulator app without signing credentials

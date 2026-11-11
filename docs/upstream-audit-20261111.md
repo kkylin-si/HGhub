@@ -53,3 +53,5 @@ iOS 的 DNS 检查发生在 URLSession 连接前，不能像 Rust 的 resolve_to
 ## CI 后续修正
 
 首次推送后的 Android job 在 SDK 准备阶段失败：`android-actions/setup-android@v3` 默认安装 `tools platform-tools`，其中旧包 `tools` 已无法从 SDK 仓库获取。工作流显式设置 `packages: platform-tools`，保留后续 Android 36 / build-tools 36.0.0 安装；不修改应用功能或测试内容。此修复推送到 fork 的 `security-audit` 分支重新验证；未创建 PR、发布安装包或变更目标 main 及仓库保护设置。
+
+同时处理 Node.js 20 action 运行时弃用警告：所有工作流中的 checkout、setup-node、setup-java、pnpm setup、Android setup、artifact 上传/下载和 release action 分别迁移到已核对声明 Node 24 的 v6、v6、v5、v5、v4、v6/v7、v3。应用构建仍使用原先配置的 Node.js 22、JDK 17 和 pnpm 10；Rust 缓存 action 的 v2 已声明 Node 24，因此保持原版本。

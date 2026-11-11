@@ -22,9 +22,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
@@ -97,7 +97,7 @@ jobs:
           cp "$f" "artifacts/HGhub_${ver}_android.apk"
           ls -lh artifacts
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: android
           path: artifacts/*.apk
@@ -108,7 +108,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: 编译未签名 App
         working-directory: native/ios
@@ -142,7 +142,7 @@ jobs:
           cp "build/HGhub_${ver}_ios-unsigned.ipa" "$GITHUB_WORKSPACE/artifacts/"
           ls -lh "$GITHUB_WORKSPACE/artifacts"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: ios
           path: artifacts/*.ipa
@@ -155,9 +155,9 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           path: dist
           merge-multiple: true
