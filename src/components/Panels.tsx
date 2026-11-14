@@ -3,6 +3,7 @@ import { api, fmt, cover as imageCover } from "../api";
 import { handleArticleClick, sanitizeHtml } from "../html";
 import type { Comment, CommentPage, Episode } from "../types";
 import { useStore } from "../store";
+import { copyText } from "../clipboard";
 import { Avatar, Empty } from "./ui";
 import { IClose, IHeart, ISendF } from "../icons";
 
@@ -162,7 +163,7 @@ export function ArticlePanel({ title, html, cover, hot, onClose }: {
   const safeHtml = useMemo(() => sanitizeHtml(html), [html, strictSecurity]);
   const openSafeLink = (url: string) => {
     api.openUrl(url).catch(() => {
-      navigator.clipboard?.writeText(url).then(() => toast("链接已复制", "ok")).catch(() => {});
+      copyText(url).then(() => toast("链接已复制", "ok")).catch(() => toast("复制失败", "info"));
     });
   };
   return (

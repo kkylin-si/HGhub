@@ -19,7 +19,7 @@ const upstream = new URLSearchParams(location.search).get("upstream");
 const open = XMLHttpRequest.prototype.open;
 XMLHttpRequest.prototype.open = function (this: XMLHttpRequest, method: string, target: string | URL, async: boolean = true, user?: string | null, credential?: string | null) {
   const url = new URL(String(target), location.href);
-  if (url.hostname === "hg.localhost" || (url.hostname === "localhost" && url.protocol === "hg:")) {
+  if (url.origin === "http://127.0.0.1:17650" || url.hostname === "hg.localhost" || (url.hostname === "localhost" && url.protocol === "hg:")) {
     target = `${proxy}${url.pathname}${url.search}`;
   }
   return open.call(this, method, target, async, user, credential);
@@ -31,7 +31,7 @@ const fixture = {
   nextSource: () => {},
   sourceKey: 0,
   playRequests: [] as { id: number; ep: number }[],
-  failEpisode: 0,
+  failEpisode: Number(new URLSearchParams(location.search).get("fail_ep")) || 0,
   getProgress: (_id: number): WatchProgress | undefined => undefined,
   record: (_id: number, _ep: number, _time: number, _duration: number, _writer?: number) => {},
   claim: (_id: number) => 0,
@@ -42,7 +42,7 @@ const fixture = {
   rejectLoggingSave: false,
   pauseBuffering: () => testHls?.pauseBuffering(),
   resumeBuffering: () => testHls?.resumeBuffering(),
-  engineState: () => ({ loading: testHls?.loadingEnabled, buffering: testHls?.bufferingEnabled, levels: testHls?.levels.length, subtitleTrack: testHls?.subtitleTrack, subtitleCount: testHls?.subtitleTracks.length, subtitleDisplay: testHls?.subtitleDisplay }),
+  engineState: () => ({ source: testHls?.url, loading: testHls?.loadingEnabled, buffering: testHls?.bufferingEnabled, levels: testHls?.levels.length, subtitleTrack: testHls?.subtitleTrack, subtitleCount: testHls?.subtitleTracks.length, subtitleDisplay: testHls?.subtitleDisplay }),
   cacheWrites: [] as { url: string; time: number }[],
   primeCache: (fraction: number) => {
     const video = document.querySelector("video")!;
@@ -151,6 +151,7 @@ api.play = async (id, ep = 1) => {
   fixture.playRequests.push({ id, ep });
   if (fixture.failEpisode === ep) throw new Error("Fixture episode unavailable");
   return { id, ep_num: ep, title: "Seek fixture", duration: 90,
+    video_url_hevc: new URLSearchParams(location.search).has("hevc") ? `${mediaSource()}?video=${id}&episode=${ep}&quality=hevc` : undefined,
     video_url: mediaSource() + (resumeTest ? `?video=${id}&episode=${ep}${mixedDuration && ep === 2 ? '&short=1' : ''}` : "") };
 };
 api.video = async (id) => ({

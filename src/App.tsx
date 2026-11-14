@@ -10,6 +10,8 @@ import Profile from "./pages/Profile";
 import SettingsPage from "./pages/Settings";
 import Feed from "./components/Feed";
 import { PostsPage, PostDetail } from "./pages/Posts";
+import { TopicsPage, TopicPage, TagsPage, TagPage } from "./pages/Discover";
+import { FollowingPage, UserPage } from "./pages/User";
 import LoginModal from "./components/LoginModal";
 import { ToastHost } from "./components/ui";
 import { DesktopRail, DesktopTitleBar } from "./components/DesktopChrome";
@@ -17,45 +19,75 @@ import ResizeHandles from "./components/ResizeHandles";
 import { tracePlayback } from "./playbackDiagnostics";
 import { IGrid, IGridF, IHome, IHomeF, ISearch, IUser, IUserF, Logo } from "./icons";
 
-/* ============ 底部标签栏（Android）—— 细瘦纯文字、低侵入 ============ */
+/* ============ 底部标签栏（移动端）—— iOS 26 液态玻璃悬浮胶囊 ============ */
+/* 设计对齐 liuran001/WeChat-LiquidGlass（iOS 26 风格）：
+   - 不贴边的悬浮胶囊玻璃条，内容透出真实折射感（backdrop blur + 高光内描边）
+   - 选中项是一枚「液滴」玻璃胶囊，用弹簧物理滑动跟随（无 JS 逐帧驱动，
+     用 CSS transition + cubic-bezier 近似 WeChat-LiquidGlass 的 DampedDragAnimation）
+   - 按压时液滴放大（对齐其 press scale 1.1x），图标带充色 */
 function TabBar() {
-  const { tab, setTab, theme } = useStore();
-  const items: { k: Tab; label: string }[] = [
-    { k: "home", label: "首页" },
-    { k: "search", label: "搜索" },
-    { k: "category", label: "分类" },
-    { k: "profile", label: "我的" },
+  const { tab, setTab, theme, platform } = useStore();
+  const android = platform === "android";
+  const items: { k: Tab; label: string; On: (p: { size?: number; className?: string; style?: React.CSSProperties; strokeWidth?: number }) => React.JSX.Element; Off: (p: { size?: number; className?: string; style?: React.CSSProperties; strokeWidth?: number }) => React.JSX.Element }[] = [
+    { k: "home", label: "首页", On: IHomeF, Off: IHome },
+    { k: "search", label: "搜索", On: ISearch, Off: ISearch },
+    { k: "category", label: "分类", On: IGridF, Off: IGrid },
+    { k: "profile", label: "我的", On: IUserF, Off: IUser },
   ];
-  /* 细瘦纯文字分栏：只有选中项高亮，没有指示点。
-     首页是沉浸视频 → 底栏压深色；搜索/分类/我的 是浅色内容页 →
-     浅色主题下底栏跟着换成浅色，深色主题保持深色。 */
+  const idx = items.findIndex((i) => i.k === tab);
   const overVideo = tab === "home";
-  const lightBar = !overVideo && theme === "light";
+  const light = !overVideo && theme === "light";
+  /* 液滴中心对齐每个等分槽位的中心，定位不受固定胶囊宽度影响。 */
+  const dropLeft = `${12.5 + idx * 25}%`;
   return (
-    <nav className="hg-tabbar absolute bottom-0 inset-x-0 z-30"
-      style={{
-        paddingBottom: "var(--sab, 0px)",
-        background: lightBar ? "rgba(250, 250, 250, .97)" : overVideo ? "#000000" : "#141414",
-        borderTop: lightBar ? "1px solid rgba(0,0,0,.08)" : overVideo ? "none" : "1px solid rgba(255,255,255,.07)",
-        boxShadow: lightBar ? "0 -2px 14px rgba(0,0,0,.05)" : "none",
+    <nav className="hg-tabbar absolute inset-x-0 bottom-0 z-30 flex justify-center"
+      style={{ paddingBottom: android ? "var(--sab, 0px)" : "calc(var(--sab, 0px) * 0.55)" }} aria-label="主导航">
+      <div className="hg-glass relative" style={{
+        width: "min(92vw, 420px)",
+        height: 56,
+        borderRadius: 28,
+        background: light ? "rgba(250, 250, 250, .62)" : "rgba(22, 22, 24, .55)",
+        boxShadow: light
+          ? "0 8px 32px rgba(0,0,0,.12), 0 1px 0 rgba(255,255,255,.85) inset, 0 0 0 .5px rgba(0,0,0,.06)"
+          : "0 8px 32px rgba(0,0,0,.38), 0 1px 0 rgba(255,255,255,.16) inset, 0 0 0 .5px rgba(255,255,255,.10)",
+        backdropFilter: "blur(24px) saturate(180%)",
+        WebkitBackdropFilter: "blur(24px) saturate(180%)",
       }}>
-      <div className="h-[40px] flex items-center px-1">
-        {items.map(({ k, label }) => {
-          const on = tab === k;
-          return (
-            <button key={k} onClick={() => setTab(k)} className="flex-1 h-full flex items-center justify-center pressable">
-              <span className="text-[12.5px] leading-none transition-colors duration-200"
-                style={{
-                  fontWeight: on ? 700 : 400,
-                  color: lightBar
-                    ? (on ? "var(--p-primary)" : "rgba(0,0,0,.45)")
-                    : (on ? "#ffffff" : "rgba(255,255,255,.6)"),
-                }}>
-                {label}
-              </span>
-            </button>
-          );
-        })}
+        {/* 液滴：跟随选中项的玻璃胶囊 */}
+        <div className="hg-drop absolute top-[4px] bottom-[4px] w-[56px]" style={{
+          left: dropLeft,
+          transform: "translateX(-50%)",
+          borderRadius: 24,
+          transition: "left 480ms cubic-bezier(.32,1.35,.45,1)",
+          background: light ? "rgba(255,255,255,.92)" : "rgba(255,255,255,.14)",
+          boxShadow: light
+            ? "0 2px 10px rgba(0,0,0,.10), 0 0 0 .5px rgba(0,0,0,.05)"
+            : "0 1px 8px rgba(255,255,255,.08) inset, 0 0 0 .5px rgba(255,255,255,.22)",
+          backdropFilter: "blur(10px) brightness(1.12)",
+          WebkitBackdropFilter: "blur(10px) brightness(1.12)",
+        }} />
+        <div className="relative h-full grid grid-cols-4">
+          {items.map(({ k, label, On, Off }) => {
+            const on = tab === k;
+            const Icon = on ? On : Off;
+            return (
+              <button key={k} onClick={() => setTab(k)}
+                className="relative flex flex-col items-center justify-center gap-[2px] pressable"
+                aria-current={on ? "page" : undefined}>
+                <Icon size={21} style={{
+                  color: on ? "var(--p-primary)" : (light ? "rgba(0,0,0,.42)" : "rgba(255,255,255,.62)"),
+                  transition: "color 200ms, transform 320ms cubic-bezier(.32,1.35,.45,1)",
+                  transform: on ? "scale(1.08) translateY(-1px)" : "scale(1)",
+                }} />
+                <span className="text-[9.5px] leading-none" style={{
+                  fontWeight: on ? 700 : 500,
+                  color: on ? "var(--p-primary)" : (light ? "rgba(0,0,0,.42)" : "rgba(255,255,255,.62)"),
+                  transition: "color 200ms",
+                }}>{label}</span>
+              </button>
+            );
+          })}
+        </div>
       </div>
     </nav>
   );
@@ -77,13 +109,18 @@ function StackPage({ page, onBack, wide, top, bottomInset }: {
   if (page.kind === "settings") return <SettingsPage onBack={onBack} wide={wide} />;
   if (page.kind === "posts") return <PostsPage onBack={onBack} wide={wide} />;
   if (page.kind === "post") return <PostDetail id={page.id} onBack={onBack} active={top} />;
+  if (page.kind === "topics") return <TopicsPage onBack={onBack} wide={wide} />;
+  if (page.kind === "topic") return <TopicPage slug={page.slug} name={page.name} onBack={onBack} wide={wide} />;
+  if (page.kind === "tags") return <TagsPage onBack={onBack} wide={wide} />;
+  if (page.kind === "tag") return <TagPage tag={page.tag} name={page.name} onBack={onBack} wide={wide} />;
+  if (page.kind === "following") return <FollowingPage onBack={onBack} wide={wide} />;
+  if (page.kind === "user") return <UserPage id={page.id} name={page.name} onBack={onBack} wide={wide} />;
   return null;
 }
 
 /* ============ 应用主体 ============ */
 function AppBody() {
   const { platform, tab, setTab, stack, pop, loginOpen, setLoginOpen, fs, clean } = useStore();
-  const isMobile = platform === "android" || platform === "ios";
   const mainRef = useRef<HTMLDivElement>(null);
   const [wide, setWide] = useState(!isMobile);
   const [collapsed, setCollapsed] = useState(false);
@@ -118,7 +155,7 @@ function AppBody() {
 
   const vis = (k: Tab) => (tab === k ? "absolute inset-0" : "absolute inset-0 invisible pointer-events-none");
   const pageActive = stack.length === 0 && !loginOpen;
-  const bottomInset = isMobile ? (fs || clean ? 0 : 40) : 14;
+  const bottomInset = isMobile ? (fs || clean ? 0 : 74) : 14;
   /* 栈页（从搜索/分类/我的进入的播放页、图文页）没有底栏，
      底部只让出安全区。之前多留了 20px，视频底边会露出一条
      「底栏」似的窄缝（底部的压暗渐变到不了屏幕最底）。 */
@@ -145,7 +182,7 @@ function AppBody() {
   );
 }
 
-/* ============ 桌面窗口壳（Windows / macOS）============ */
+/* ============ 桌面窗口壳（Windows / macOS / Linux）============ */
 function DesktopShell() {
   const [collapsed, setCollapsed] = useState(false);
   const { theater, platform } = useStore();
@@ -155,8 +192,8 @@ function DesktopShell() {
       <div className="relative flex-1 min-h-0">
         <ShellInner collapsed={collapsed || theater} theater={theater} />
       </div>
-      {/* 边缘缩放热区只对无边框窗口（Windows）有效，macOS 走原生窗口边框 */}
-      {platform === "windows" && <ResizeHandles />}
+      {/* 边缘缩放热区只对无边框窗口（Windows / Linux）有效，macOS 走原生窗口边框 */}
+      {(platform === "windows" || platform === "linux") && <ResizeHandles />}
     </div>
   );
 }
@@ -219,7 +256,7 @@ function MobileShell() {
   const { platform } = useStore();
   return (
     <div className={`absolute inset-0 flex flex-col bg-canvas plat-${platform}`}
-      style={{ "--sat": "max(env(safe-area-inset-top), 12px)", "--sab": "max(env(safe-area-inset-bottom), 16px)" } as React.CSSProperties}>
+      style={{ "--sat": "max(env(safe-area-inset-top), 12px)", "--sab": platform === "android" ? "max(env(safe-area-inset-bottom), 24px)" : "max(env(safe-area-inset-bottom), 16px)" } as React.CSSProperties}>
       <div className="relative flex-1 min-h-0">
         <AppBody />
       </div>
@@ -233,6 +270,31 @@ export default function App() {
   useEffect(() => {
     tracePlayback("navigation.change", { tab, stack: stack.map(p => ({ page: p.kind, key: p.key })), login_open: loginOpen });
   }, [tab, stack, loginOpen]);
+
+  /* iOS：长按快进会触发 WKWebView 系统文本选择放大镜（loupe），纯 CSS 挡不住。
+     原生层已默认关闭文本交互（isTextInteractionEnabled=false）；这里在用户触碰输入框时
+     重新打开、失焦时再关闭，避免影响搜索/评论/登录等文本输入。 */
+  useEffect(() => {
+    if (platform !== "ios") return;
+    const setTI = (enabled: boolean) => invoke("set_text_interaction", { enabled }).catch(() => {});
+    const INPUTS = 'input, textarea, [contenteditable="true"]';
+    const onDown = (e: Event) => {
+      const t = e.target as HTMLElement | null;
+      if (t && typeof t.closest === "function" && t.closest(INPUTS)) setTI(true);
+    };
+    const onFocusOut = (e: FocusEvent) => {
+      const t = e.target as HTMLElement | null;
+      if (t && typeof t.closest === "function" && t.closest(INPUTS)) setTI(false);
+    };
+    document.addEventListener("touchstart", onDown, { capture: true, passive: true });
+    document.addEventListener("pointerdown", onDown, { capture: true, passive: true });
+    document.addEventListener("focusout", onFocusOut, true);
+    return () => {
+      document.removeEventListener("touchstart", onDown, true);
+      document.removeEventListener("pointerdown", onDown, true);
+      document.removeEventListener("focusout", onFocusOut, true);
+    };
+  }, [platform]);
 
   /* —— 安卓硬件返回键 ——
      层级：全屏 → 面板/弹层 → 登录框 → 页面栈 → 回首页 → 退出应用。

@@ -1,14 +1,15 @@
 import React, { useEffect, useRef, useState } from "react";
 import Hls from "hls.js";
-import { useStore } from "../store";
-import { attachSubtitles } from "../subtitles";
 import { attachPlaybackCache, attachDirectCache, type CacheRange } from "../playbackCache";
+import { attachSubtitles } from "../subtitles";
+import { useStore } from "../store";
 import { fmtTime, platform, mediaUrl } from "../api";
-import { mediaResource, observeHls, usePlayerDiagnostics } from "../playbackDiagnostics";
+import { mediaErrorMessage } from "../mediaErrors";
+import { mediaHost, mediaResource, observeHls, usePlayerDiagnostics } from "../playbackDiagnostics";
 import { usePlaybackActivity } from "../usePlaybackActivity";
 import { useSeekInput } from "../useSeekInput";
 import PlaybackLock from "./PlaybackLock";
-import { ICompress, IExpand, ILockF, ISubtitles, IPauseF, IPlayF, IVol, IVolMute } from "../icons";
+import { ISubtitles, ICompress, IExpand, ILockF, IPauseF, IPlayF, IVol, IVolMute } from "../icons";
 
 type Props = {
   src: string;              // 原始 m3u8 地址
@@ -41,7 +42,7 @@ export default function Player({
   const [playing, setPlaying] = useState(false);
   const [waiting, setWaiting] = useState(false);
   const [time, setTime] = useState(0);
-  const [cachedRanges, setCachedRanges] = useState<CacheRange[]>([]);
+  const [cacheRanges, setCacheRanges] = useState<CacheRange[]>([]);
   const [duration, setDuration] = useState(0);
   const [full, setFull] = useState(false);
   const [rate, setRate] = useState(1);
@@ -54,7 +55,7 @@ export default function Player({
       if (!video || !activity.isActive()) return;
       requestSeek(target, `legacy_${input}`);
       setWaiting(true);
-      if (hlsRef.current?.bufferingEnabled) {
+      if (hlsRef.current) {
         try { hlsRef.current.startLoad(target); } catch { /* ignore */ }
       }
       video.currentTime = target;
@@ -66,22 +67,25 @@ export default function Player({
   useEffect(() => {
     const video = videoRef.current;
     if (!video || !src) return;
+    setErrMsg("");
+    setCacheRanges([]);
+    setWaiting(false);
+    recoverCountRef.current = 0;
     const url = mediaUrl(src);
     const useHls = !url.includes("/seg?u=");
-    recoverCountRef.current = 0;
-    setErrMsg("");
-    trace("source.load", { engine: useHls && Hls.isSupported() ? "hls.js" : "native", auto_play: autoPlay });
+    let detachCache: (() => void) | undefined;
+    let detachSubtitles: (() => void) | undefined;
+    trace("source.load", { engine: Hls.isSupported() ? "hls.js" : "native", auto_play: autoPlay, resource: mediaResource(src), host: mediaHost(src) });
 
     if (hlsRef.current) { hlsRef.current.destroy(); hlsRef.current = null; }
 
-    let detachCache: (() => void) | undefined;
-    let detachSubtitles: (() => void) | undefined;
     if (useHls && Hls.isSupported()) {
       const hls = new Hls({
         // 禁用从插播/内容引导 JSON 派生直连 URL 的可选功能。
         interstitialsController: undefined,
         contentSteeringController: undefined,
         enableInterstitialPlayback: false,
+        // WKWebView 里 hls.js 的 worker 不稳，iOS 关掉
         enableWorker: platform !== "ios",
         // Keep the same macOS seek workaround as the shared player.
         preferManagedMediaSource: false,
@@ -100,8 +104,8 @@ export default function Player({
         fragLoadingRetryDelay: 400,
       });
       hlsRef.current = hls;
+      detachCache = attachPlaybackCache(hls, video, activity.isActive, setCacheRanges, undefined, () => subtitlesRef.current);
       detachSubtitles = attachSubtitles(video, hls, () => subtitlesRef.current);
-      detachCache = attachPlaybackCache(hls, video, activity.isActive, setCachedRanges, undefined, () => subtitlesRef.current);
       observeHls(hls, trace);
       hls.loadSource(url);
       hls.attachMedia(video);
@@ -137,6 +141,7 @@ export default function Player({
         const detail = `${data.type}/${data.details}/${data.response?.code ?? ""}/${String(data.reason ?? "").slice(0, 80)}`;
         (window as unknown as { __hlsErr?: string }).__hlsErr = detail;
         setErrMsg(detail);
+        if (!activity.isActive()) return;
         if (data.type === Hls.ErrorTypes.NETWORK_ERROR) hls.startLoad();
         else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) hls.recoverMediaError();
         else { hls.destroy(); hlsRef.current = null; }
@@ -144,8 +149,7 @@ export default function Player({
     } else {
       // Safari / 部分 WebView 原生支持 HLS
       detachSubtitles = attachSubtitles(video, null, () => subtitlesRef.current);
-      detachCache = useHls ? attachPlaybackCache(null, video, activity.isActive, setCachedRanges, url, () => subtitlesRef.current)
-        : attachDirectCache(url, video, activity.isActive, setCachedRanges);
+      detachCache = useHls ? attachPlaybackCache(null, video, activity.isActive, setCacheRanges, url, () => subtitlesRef.current) : attachDirectCache(url, video, activity.isActive, setCacheRanges);
       video.src = url;
       if (autoPlay) activity.play("native_autoplay", true);
     }
@@ -158,13 +162,20 @@ export default function Player({
     };
   }, [src, autoPlay]);
 
-  useEffect(() => { videoRef.current?.dispatchEvent(new Event("subtitle-preference")); }, [subtitlesEnabled]);
-
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
     video.muted = muted;
   }, [muted]);
+
+  useEffect(() => { videoRef.current?.dispatchEvent(new Event("subtitle-preference")); }, [subtitlesEnabled]);
+
+  // iOS 内联播放：部分 WKWebView 只认 HTML 属性，不认 React 的 playsInline
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    video.setAttribute("webkit-playsinline", "true");
+  }, []);
 
   useEffect(() => {
     const onFs = () => setFull(!!document.fullscreenElement);
@@ -204,7 +215,6 @@ export default function Player({
         ref={videoRef}
         poster={poster}
         playsInline
-        webkit-playsinline="true"
         preload="auto"
         muted={muted}
         loop={loop}
@@ -218,6 +228,12 @@ export default function Player({
         onTimeUpdate={(e) => setTime((e.target as HTMLVideoElement).currentTime)}
         onLoadedMetadata={(e) => setDuration((e.target as HTMLVideoElement).duration || 0)}
         onEnded={() => { if (activity.isActive()) onEnded?.(); }}
+        onError={() => {
+          if (hlsRef.current) return;
+          setWaiting(false);
+          setPlaying(false);
+          setErrMsg(mediaErrorMessage(videoRef.current?.error ?? null));
+        }}
       />
 
       {errMsg && (
@@ -243,12 +259,12 @@ export default function Player({
 
       {controls && (
         <div className="absolute inset-x-0 bottom-0 px-3 pb-2 pt-8 bg-gradient-to-t from-black/80 to-transparent opacity-0 group-hover:opacity-100 transition-opacity">
-          <div className="desktop-seek is-seekable">
-            <div className="desktop-seek-track">
-              {duration > 0 && cachedRanges.map((range, i) => <span key={i} className="desktop-seek-buffer" style={{ left: `${Math.max(0, range.start / duration) * 100}%`, width: `${Math.max(0, Math.min(duration, range.end) - Math.max(0, range.start)) / duration * 100}%` }} />)}
-              <span className="desktop-seek-played" style={{ width: `${pct}%` }} />
+          <div className="relative">
+            <div className="absolute inset-x-0 top-1/2 h-[3px] pointer-events-none">
+              {cacheRanges.map((r, i) => <span key={i} className="absolute h-full bg-primary/40" style={{ left: `${duration ? r.start / duration * 100 : 0}%`, width: `${duration ? (r.end - r.start) / duration * 100 : 0}%` }} />)}
             </div>
-            <input aria-label="播放进度" type="range" {...seek.inputProps} />
+          <input aria-label="播放进度" type="range" {...seek.inputProps}
+            className="hg-range w-full" style={{ ...seek.inputProps.style, "--fill": `${pct}%` } as React.CSSProperties} />
           </div>
           <div className="flex items-center gap-3 mt-1 text-white">
             <button onClick={toggle} aria-label={playing ? "暂停" : "播放"} className="pressable">
@@ -260,7 +276,7 @@ export default function Player({
             <span className="text-[11px] tabular-nums text-white/85">{fmtTime(seek.time)} / {fmtTime(duration)}</span>
             <div className="flex-1" />
             <button aria-label="字幕" aria-pressed={subtitlesEnabled} title={subtitlesEnabled ? "关闭字幕" : "显示字幕"}
-              onClick={() => setSubtitlesEnabled(!subtitlesEnabled)} className={`pressable ${subtitlesEnabled ? "text-primary" : "text-white/65"}`}><ISubtitles size={20} /></button>
+              onClick={() => setSubtitlesEnabled(!subtitlesEnabled)} className="pressable"><ISubtitles size={20} /></button>
             <button onClick={() => setControlsLocked(true)} aria-label="锁定播放控制" title="锁定播放控制" aria-pressed={false} className="pressable">
               <ILockF size={16} />
             </button>

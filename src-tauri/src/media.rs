@@ -316,8 +316,10 @@ use tauri::http::{Response, StatusCode};
 /// 前端 `src/api.ts` 的 `LOCAL` 必须与此一致，否则封面与视频全部加载失败。
 #[cfg(any(target_os = "windows", target_os = "android"))]
 pub const LOCAL_ORIGIN: &str = "http://hg.localhost";
-#[cfg(not(any(target_os = "windows", target_os = "android")))]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub const LOCAL_ORIGIN: &str = "hg://localhost";
+#[cfg(target_os = "linux")]
+pub const LOCAL_ORIGIN: &str = crate::linux_http::ORIGIN;
 
 const IMG_KEY: &[u8] = b"f5d965df75336270";
 const IMG_IV: &[u8] = b"97b60394abc2fbe1";
@@ -1224,7 +1226,7 @@ mod tests {
         );
         let body = std::str::from_utf8(response.body()).unwrap();
         assert_eq!(body.matches(&format!("{LOCAL_ORIGIN}/seg?u=")).count(), 4);
-        assert!(!body.contains("URI=\"http://127.0.0.1"));
+        assert!(!body.contains("URI=\"http://127.0.0.1/key\""));
         assert!(body.contains("https%3A%2F%2Fcdn%2Eexample%2Faudio%2Flist%2Em3u8"));
         assert_eq!(
             response.headers()["Content-Type"],

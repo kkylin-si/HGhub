@@ -33,7 +33,7 @@ export function DesktopTitleBar({ collapsed, onToggle }: { collapsed: boolean; o
       onDoubleClick={(e) => { if (!(e.target as HTMLElement).closest("button")) appWindow().toggleMaximize().catch(() => {}); }}>
       <div className="win-wordmark" data-tauri-drag-region>
         <Logo size={24} />
-        <span>HG<span className="win-wordmark-light">hub</span></span>
+        <span>HG<span className="win-wordmark-light">hub</span>X</span>
       </div>
       <button className="win-caption-tool" aria-label={collapsed ? "展开侧栏" : "收起侧栏"} onClick={onToggle}>
         <ISidebar size={17} strokeWidth={1.7} />
@@ -106,11 +106,11 @@ export function DesktopRail({ collapsed }: { collapsed: boolean }) {
           <button className="win-account" onClick={() => { setTab("profile"); if (!user) setLoginOpen(true); }}>
             <Avatar size={34} hue={220} name={user?.nickname} icon={user ? undefined : <IUser size={17} />} />
             <span className="win-account-copy">
-              <strong>{user?.nickname || "登录 HGhub"}</strong>
+              <strong>{user?.nickname || "登录 HGhubX"}</strong>
               <small>{user ? "你的精彩，都在这里" : "留住每一次心动"}</small>
             </span>
           </button>
-          <span className="win-sidebar-version">HGhub for {platform === "macos" ? "macOS" : platform === "linux" ? "Linux" : "Windows"} {APP_VERSION}</span>
+          <span className="win-sidebar-version">HGhubX for {platform === "macos" ? "macOS" : platform === "linux" ? "Linux" : "Windows"} {APP_VERSION}</span>
         </div>
       </div>
     </nav>

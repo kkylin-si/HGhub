@@ -34,33 +34,35 @@
 }
 .plat-windows { --r-sm: 4px; --r-md: 8px; --r-lg: 8px; --r-ctl: 4px; --nav-h: 0px; }
 .plat-macos { --r-sm: 6px; --r-md: 10px; --r-lg: 12px; --r-ctl: 6px; --nav-h: 0px; }
+.plat-linux { --r-sm: 4px; --r-md: 8px; --r-lg: 8px; --r-ctl: 4px; --nav-h: 0px; }
 .plat-ios { --r-sm: 10px; --r-md: 14px; --r-lg: 18px; --r-ctl: 999px; -webkit-touch-callout: none; }
 html.theme-light {
   color-scheme: light;
-  --p-canvas: #f3f3f3;
-  --p-bg: #f9f9f9;
-  --p-s1: #ffffff;
-  --p-s2: #f3f3f3;
-  --p-s3: #e8e8e8;
-  --p-s4: #dcdcdc;
-  --p-on: #1a1a1a;
-  --p-mut: #5c5c5c;
-  --p-dim: #8a8a8a;
-  --p-primary: #0067c0;
-  --p-on-primary: #ffffff;
-  --p-pc: #cce4f7;
-  --p-on-pc: #003a66;
-  --p-sec: #e5e5e5;
-  --p-on-sec: #1a1a1a;
-  --p-like: #e74856;
-  --p-star: #9a6b00;
-  --p-success: #0f7b0f;
-  --p-danger: #c42b1c;
-  --p-on-danger: #ffffff;
-  --p-glow: rgba(0, 103, 192, .2);
-  --p-hover: rgba(0, 0, 0, .05);
-  --p-tint: rgba(0, 103, 192, .12);
-  --p-shadow: 0 18px 48px rgba(0, 0, 0, .14), 0 2px 8px rgba(0, 0, 0, .06);
+  /* 暖灰底，避免纯白大面积刺眼；正文保持足够对比度 */
+  --p-canvas: #ebe8e2;
+  --p-bg: #f3f0ea;
+  --p-s1: #faf8f4;
+  --p-s2: #f1ede6;
+  --p-s3: #e6e1d9;
+  --p-s4: #d7d1c7;
+  --p-on: #2a2824;
+  --p-mut: #68635b;
+  --p-dim: #918b82;
+  --p-primary: #256b9e;
+  --p-on-primary: #f8f5f0;
+  --p-pc: #d9e7f0;
+  --p-on-pc: #1d4c6b;
+  --p-sec: #e7e2da;
+  --p-on-sec: #2a2824;
+  --p-like: #cf5264;
+  --p-star: #8a640f;
+  --p-success: #2f7a3a;
+  --p-danger: #b33a32;
+  --p-on-danger: #fff7f4;
+  --p-glow: rgba(37, 107, 158, .18);
+  --p-hover: rgba(43, 40, 36, .06);
+  --p-tint: rgba(37, 107, 158, .10);
+  --p-shadow: 0 16px 40px rgba(60, 50, 35, .12), 0 2px 8px rgba(60, 50, 35, .06);
 }
 
 @theme inline {
@@ -90,7 +92,7 @@ html.theme-light {
   --color-on-danger: var(--p-on-danger);
 }
 
-html, body, #root { height: 100%; overflow: hidden; overscroll-behavior: none; }
+html, body, #root { height: 100%; height: 100dvh; overflow: hidden; overscroll-behavior: none; }
 body {
   margin: 0;
   background: var(--p-canvas);
@@ -99,8 +101,10 @@ body {
   -webkit-font-smoothing: antialiased;
   -webkit-tap-highlight-color: transparent;
   user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
 }
-input, textarea { user-select: text; }
+input, textarea { user-select: text; -webkit-user-select: text; }
 img, video { -webkit-user-drag: none; }
 button { cursor: pointer; font-family: inherit; }
 
@@ -123,6 +127,14 @@ button { cursor: pointer; font-family: inherit; }
 html.theme-light .elev-1 { box-shadow: 0 1px 2px rgba(0,0,0,.05), 0 4px 12px rgba(0,0,0,.04); }
 html.theme-light .elev-2 { box-shadow: 0 2px 8px rgba(0,0,0,.07); }
 html.theme-light .elev-3 { box-shadow: 0 10px 30px rgba(0,0,0,.1); }
+html.theme-light .spinner { border-color: rgba(43,40,36,.14); border-top-color: var(--p-primary); }
+html.theme-light input[type="range"].hg-range::-webkit-slider-runnable-track {
+  background: linear-gradient(to right, var(--p-primary) var(--fill,0%), rgba(43,40,36,.18) var(--fill,0%));
+}
+html.theme-light input[type="range"].hg-range::-webkit-slider-thumb {
+  background: var(--p-s1);
+  box-shadow: 0 0 0 1px rgba(43,40,36,.12), 0 0 10px var(--p-glow);
+}
 .glow-neon, .glow-cyan { box-shadow: 0 4px 18px var(--p-glow); }
 .tsh { text-shadow: 0 1px 10px rgba(0,0,0,.6); }
 .pressable { transition: transform .16s cubic-bezier(.2,0,0,1), opacity .16s, background-color .16s, color .16s; }
@@ -240,6 +252,7 @@ input[type="range"].hg-range::-webkit-slider-thumb { -webkit-appearance: none; w
 /* 仅桌面窗口（Windows 无边框 / macOS Overlay）：右侧/底部留 12px 呼吸位 + 圆角。
    安卓必须不加，否则内容比屏幕小一圈（右侧、底部各 12px 露 canvas 底）。 */
 .plat-windows .win-main,
+.plat-linux .win-main,
 .plat-macos .win-main {
   margin: 0 12px 12px 0;
   border-radius: 13px;
@@ -442,7 +455,7 @@ input[type="range"].hg-range::-webkit-slider-thumb { -webkit-appearance: none; w
   pointer-events: none; position: absolute; height: 2px; inset: auto 0;
   background: rgba(255,255,255,.16); border-radius: 2px; overflow: hidden; transition: height .16s;
 }
-.desktop-seek-buffer { position: absolute; height: 100%; background: rgba(255,255,255,.48); }
+.desktop-seek-buffer { position: absolute; height: 100%; background: rgba(255,255,255,.10); }
 .desktop-seek-played { position: absolute; height: 100%; background: #80bbdf; border-radius: inherit; }
 .desktop-seek:hover .desktop-seek-track, .desktop-seek:focus-within .desktop-seek-track { height: 4px; }
 .desktop-seek > input {
@@ -485,7 +498,7 @@ input[type="range"].hg-range::-webkit-slider-thumb { -webkit-appearance: none; w
 .player-surface .player-root,
 .player-root { background: #15181d; }
 
-/* —— 移动端沉浸全屏：固定铺满全屏视口，脱离外层滚动容器 scrollTop 影响 —— */
+/* —— 移动端沉浸全屏：固定铺满视口，不受外层滚动容器影响 —— */
 .fs-immersive {
   position: fixed;
   inset: 0;
@@ -496,7 +509,7 @@ input[type="range"].hg-range::-webkit-slider-thumb { -webkit-appearance: none; w
   overflow: hidden;
 }
 
-/* —— 移动端沉浸全屏（系统仍处于竖屏时的 CSS 90° 旋转兜底） —— */
+/* —— 移动端沉浸全屏（系统仍竖屏时的 CSS 90° 旋转兜底） —— */
 .fs-landscape {
   position: fixed;
   top: 50%; left: 50%; right: auto; bottom: auto;
@@ -527,7 +540,8 @@ input[type="range"].hg-range::-webkit-slider-thumb { -webkit-appearance: none; w
 .article-body ul, .article-body ol { padding-left: 18px; margin: 8px 0; }
 .article-body li { margin: 4px 0; }
 .article-body blockquote { margin: 10px 0; padding: 8px 12px; border-left: 3px solid var(--p-primary); background: rgba(255,255,255,.04); border-radius: 6px; }
-html.theme-light .article-body { color: rgba(20,24,30,.82); }
+html.theme-light .article-body { color: rgba(42, 40, 36, .88); }
+html.theme-light .article-body blockquote { background: rgba(43, 40, 36, .045); }
 
 /* ===================================================================
    视频浮层 / 移动端底栏：固定「亮字压暗底」
@@ -546,6 +560,8 @@ html.theme-light .article-body { color: rgba(20,24,30,.82); }
 .hg-chip-strong  { background: rgba(0, 0, 0, .62); color: #fff; }
 .hg-chip:active  { background: rgba(0, 0, 0, .62); }
 .hg-ov-shadow    { text-shadow: 0 1px 8px rgba(0, 0, 0, .7); }
+/* 没有压暗层时的文字保读：近处硬阴影 + 远处柔光，亮画面也不糊 */
+.hg-ov-shadow-strong { text-shadow: 0 1px 3px rgba(0, 0, 0, .92), 0 2px 12px rgba(0, 0, 0, .78); }
 
 /* 安卓 WebView 点按会留下系统黄色焦点框，视频/底栏这类沉浸按钮一律去掉 */
 .hg-tabbar button,
@@ -556,6 +572,3 @@ html.theme-light .article-body { color: rgba(20,24,30,.82); }
 .hg-tabbar button:focus-visible,
 .hg-player-ui button:focus,
 .hg-player-ui button:focus-visible { outline: none; }
-
-/* Eight previews fill wide containers and retain horizontal scrolling on phones. */
-.category-preview > button { flex: 1 0 104px; min-width: 0; }

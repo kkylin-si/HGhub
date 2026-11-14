@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useRef, useSyncExternalStore, type RefObject } from "react";
 import Hls from "hls.js";
 import type { FragBufferedData, FragLoadedData, FragLoadingData } from "hls.js";
+import { copyText } from "./clipboard";
 
 type Data = Record<string, unknown>;
 type Status = { enabled: boolean; path: string | null; error: string | null };
@@ -74,8 +75,7 @@ export async function copyPlaybackLog() {
   await flushPlaybackLog();
   const text = await playbackLogApi.read();
   if (!text) throw new Error("尚无诊断日志，请开启后复现问题");
-  if (!navigator.clipboard) throw new Error("当前环境无法使用剪贴板，请从日志目录取出 playback.log");
-  await navigator.clipboard.writeText(text);
+  await copyText(text);
 }
 
 export function mediaResource(raw: string) {
@@ -86,6 +86,23 @@ export function mediaResource(raw: string) {
   let hash = 2166136261;
   for (const b of new TextEncoder().encode(raw)) hash = Math.imul(hash ^ b, 16777619) >>> 0;
   return `r${hash.toString(16).padStart(8, "0")}`;
+}
+
+/**
+ * 只取 host，用来判断「是哪条 CDN / 哪个接口域名」。
+ * 不含 path 与 query，所以能落盘：出问题时一眼看出是源站、还是某个分片域名挂了。
+ */
+export function mediaHost(raw: string): string {
+  try {
+    const url = new URL(raw);
+    if (url.protocol === "hg:" || url.hostname === "hg.localhost") {
+      const inner = url.searchParams.get("u");
+      if (inner) return new URL(inner).host;
+    }
+    return url.host;
+  } catch {
+    return "?";
+  }
 }
 
 function ranges(value: TimeRanges) {
@@ -206,13 +223,13 @@ export function observeHls(hls: Hls, trace: (event: string, data?: Data) => void
       if (!playbackLogEnabled()) return;
       const { frag } = data;
       const loading = frag.stats.loading;
-      trace(event, { resource: mediaResource(frag.url), fragment: frag.sn, start: round(frag.start), duration: round(frag.duration), bytes: frag.stats.loaded,
+      trace(event, { resource: mediaResource(frag.url), host: mediaHost(frag.url), fragment: frag.sn, start: round(frag.start), duration: round(frag.duration), bytes: frag.stats.loaded,
         load_ms: loading.end > 0 && loading.end >= loading.start ? round(loading.end - loading.start) : null,
         first_byte_ms: loading.first > 0 && loading.first >= loading.start ? round(loading.first - loading.start) : null });
     });
   }
   hls.on(Hls.Events.ERROR, (_event, data) => trace("hls.error", { type: data.type, detail: data.details, fatal: data.fatal, status: data.response?.code,
-    fragment: data.frag?.sn, resource: data.frag ? mediaResource(data.frag.url) : undefined }));
+    fragment: data.frag?.sn, resource: data.frag ? mediaResource(data.frag.url) : undefined, host: data.frag ? mediaHost(data.frag.url) : undefined }));
 }
 
 export function installPlaybackPageEvents() {

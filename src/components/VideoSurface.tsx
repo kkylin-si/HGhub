@@ -1,5 +1,6 @@
 import React, { useEffect, useImperativeHandle, useRef, forwardRef, useState } from "react";
 import Hls from "hls.js";
+import { mediaErrorMessage } from "../mediaErrors";
 import { attachSubtitles } from "../subtitles";
 import { attachPlaybackCache, attachDirectCache, type CacheRange } from "../playbackCache";
 import { isLocalMedia, platform, mediaUrl } from "../api";
@@ -413,6 +414,7 @@ const VideoSurface = forwardRef<VideoHandle, Props>(function VideoSurface(
           const v = videoRef.current;
           if (v && !v.paused && activity.isActive()) onPlaying?.();
         }}
+        onError={(e) => { if (activity.isActive()) onError?.(mediaErrorMessage(e.currentTarget.error)); }}
         onEnded={() => {
           if (!nearEndFiredRef.current && activity.isActive()) {
             nearEndFiredRef.current = true;

@@ -6,40 +6,83 @@ import { useStore } from "../store";
 import { ISearch } from "../icons";
 import { Empty } from "../components/ui";
 
+/* Fisher-Yates 洗牌：首页第一页随机打乱，避免每次进来都停在同一个 top1 */
+function shuffle<T>(arr: T[]): T[] {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
 export default function Home({ active, bottomInset }: { active: boolean; bottomInset: number }) {
-  const { toast } = useStore();
+  const { toast, lineEpoch } = useStore();
   const [items, setItems] = useState<VideoCard[]>([]);
   const [page, setPage] = useState(1);
   const [loading, setLoading] = useState(false);
   const [done, setDone] = useState(false);
   const [error, setError] = useState("");
   const loadingRef = useRef(false);
+  /* 翻页失败退避：失败后 5 秒内不再因滚动触发重试，连续失败只提示一次 */
+  const retryAt = useRef(0);
+  const failStreak = useRef(0);
+  const lineEpochRef = useRef(lineEpoch);
+  lineEpochRef.current = lineEpoch;
+  const itemsRef = useRef(items);
+  itemsRef.current = items;
 
-  const load = useCallback(async (p: number) => {
-    if (loadingRef.current || done) return;
+  const load = useCallback(async (p: number): Promise<void> => {
+    if (loadingRef.current || (done && p > 1)) return;
+    const requestEpoch = lineEpochRef.current;
+    let retryAfterLineChange = false;
     loadingRef.current = true;
     setLoading(true);
     setError("");
     try {
-      const res = await api.feed(p, 10);
+      const res = await api.feed(p, 30);
       const list = res?.items || [];
+      const ordered = p === 1 ? shuffle(list) : list;
       setItems((prev) => {
         const seen = new Set(prev.map((x) => x.id));
-        return [...prev, ...list.filter((x) => !seen.has(x.id))];
+        return [...prev, ...ordered.filter((x) => !seen.has(x.id))];
       });
       setPage(p);
+      failStreak.current = 0;
+      retryAt.current = 0;
       if (!list.length || (res?.pagination && p >= res.pagination.pages)) setDone(true);
     } catch (e) {
       const message = (e as Error).message || "加载失败";
-      setError(message);
-      toast(message, "info");
+      const stale = requestEpoch !== lineEpochRef.current;
+      if (!stale) {
+        setError(message);
+        if (p > 1) retryAt.current = Date.now() + 5000;
+        if (failStreak.current++ === 0) toast(message, "info");
+      }
+      /* 请求在旧线路上发出、期间线路已切换：等 finally 里用新线路补拉一次 */
+      if (stale && !itemsRef.current.length) retryAfterLineChange = true;
     } finally {
       loadingRef.current = false;
       setLoading(false);
+      if (retryAfterLineChange) {
+        setDone(false);
+        setError("");
+        void load(1);
+      }
     }
   }, [done, toast]);
 
   useEffect(() => { if (!items.length) load(1); /* eslint-disable-next-line */ }, []);
+
+  /* 线路切换后：首页还没拿到数据（加载失败或空）就在新线路上重拉一次。
+     已有数据时不动，避免打断正在播放的视频。 */
+  useEffect(() => {
+    if (!lineEpoch || items.length || loadingRef.current) return;
+    setDone(false);
+    setError("");
+    void load(1);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [lineEpoch]);
 
   const ids = items.map((v) => v.id);
 
@@ -47,7 +90,7 @@ export default function Home({ active, bottomInset }: { active: boolean; bottomI
     <div className="absolute inset-0 bg-black">
       {items.length ? (
         <Feed videoIds={ids} mode="home" active={active} bottomInset={bottomInset}
-          onNearEnd={() => { if (!loading && !done) load(page + 1); }} />
+          onNearEnd={() => { if (!loading && !done && Date.now() >= retryAt.current) load(page + 1); }} />
       ) : !loading && error ? (
         <div className="absolute inset-0 flex items-center justify-center bg-bg">
           <Empty icon={<ISearch size={26} />} title="首页加载失败" sub={error} action="重试" onAction={() => void load(1)} />

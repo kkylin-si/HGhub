@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import { api, fmt } from "../api";
-import type { RankItem, VideoCard } from "../types";
+import { api, fmt, isMobile } from "../api";
+import type { HotWord, Post, RankItem, VideoCard } from "../types";
 import { useStore } from "../store";
 import { Masonry, RankRow } from "../components/cards";
-import { Empty } from "../components/ui";
+import { Empty, Img } from "../components/ui";
 import { IBack, IClose, IFireF, IRefresh, ISearch, ITrophy } from "../icons";
 
 const HOT_TAGS = ["都市", "逆袭", "古风", "系统", "后宫", "校园", "仙侠", "职场", "大男主", "御姐", "脑洞", "奇幻"];
@@ -12,39 +12,78 @@ export default function Search({ active, wide }: { active: boolean; wide: boolea
   const { push, searchHist, addSearch, clearSearchHist, toast } = useStore();
   const [q, setQ] = useState("");
   const [submitted, setSubmitted] = useState("");
+  const [tab, setTab] = useState<"video" | "post">("video");
   const [items, setItems] = useState<VideoCard[]>([]);
+  const [posts, setPosts] = useState<Post[]>([]);
   const [page, setPage] = useState(0);
   const [pages, setPages] = useState(1);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const busy = useRef(false);
+  /* 请求序号：新关键词或清空时自增，过期请求的结果直接丢弃 */
+  const seqRef = useRef(0);
+  const [hotWords, setHotWords] = useState<HotWord[]>([]);
 
+  /* 移动端进入搜索页不自动聚焦：iOS 会立刻弹键盘遮住内容（#20）。
+     桌面端没有软键盘，聚焦便于直接打字。 */
   useEffect(() => {
-    if (active && !/Android/i.test(navigator.userAgent)) inputRef.current?.focus();
+    if (active && !isMobile) inputRef.current?.focus();
   }, [active]);
 
-  const run = async (keyword: string, p: number) => {
-    if (busy.current) return;
-    if (p > pages && p > 1) return;
+  const refreshHot = () => {
+    api.searchHot().then((r) => setHotWords(r?.items || [])).catch(() => {});
+  };
+  useEffect(() => {
+    if (active) refreshHot();
+  }, [active]);
+
+  const run = async (keyword: string, p: number, kind: "video" | "post" = tab) => {
+    if (p > 1 && (busy.current || p > pages)) return;
+    const seq = p === 1 ? ++seqRef.current : seqRef.current;
     busy.current = true;
     setLoading(true);
     try {
-      const res = await api.search(keyword, p, 20);
-      setItems((prev) => {
-        const base = p === 1 ? [] : prev;
-        const seen = new Set(base.map((x) => x.id));
-        return [...base, ...(res?.items || []).filter((x) => !seen.has(x.id))];
-      });
+      const res = await api.search(keyword, p, 20, kind);
+      if (seq !== seqRef.current) return;
+      if (kind === "post") {
+        const list = (res?.items || []) as unknown as Post[];
+        setPosts((prev) => {
+          const base = p === 1 ? [] : prev;
+          const seen = new Set(base.map((x) => x.id));
+          return [...base, ...list.filter((x) => !seen.has(x.id))];
+        });
+      } else {
+        const list = (res?.items || []) as unknown as VideoCard[];
+        setItems((prev) => {
+          const base = p === 1 ? [] : prev;
+          const seen = new Set(base.map((x) => x.id));
+          return [...base, ...list.filter((x) => !seen.has(x.id))];
+        });
+      }
       setPage(p);
       setPages(res?.pagination?.pages || 1);
       setErr(null);
     } catch (e) {
+      if (seq !== seqRef.current) return;
       setErr((e as Error).message || "搜索失败");
     } finally {
-      busy.current = false;
-      setLoading(false);
+      if (seq === seqRef.current) {
+        busy.current = false;
+        setLoading(false);
+      }
     }
+  };
+
+  const changeTab = (next: "video" | "post") => {
+    if (next === tab) return;
+    setTab(next);
+    setItems([]);
+    setPosts([]);
+    setPage(0);
+    setPages(1);
+    setErr(null);
+    if (submitted) void run(submitted, 1, next);
   };
 
   const submit = (keyword: string) => {
@@ -53,6 +92,8 @@ export default function Search({ active, wide }: { active: boolean; wide: boolea
     setSubmitted(k);
     addSearch(k);
     setItems([]);
+    setPosts([]);
+    setPage(0);
     setPages(1);
     run(k, 1);
   };
@@ -66,9 +107,9 @@ export default function Search({ active, wide }: { active: boolean; wide: boolea
         <form className="flex-1 flex items-center gap-2 h-11 rounded-(--r-ctl) bg-s3 px-3.5 focus-within:bg-s4 transition-colors"
           onSubmit={(e) => { e.preventDefault(); submit(q); }}>
           <ISearch size={17} className="text-mut shrink-0" />
-          <input ref={inputRef} value={q} onChange={(e) => setQ(e.target.value)} placeholder="搜索短剧、作者、题材…"
+          <input ref={inputRef} value={q} onChange={(e) => setQ(e.target.value)} placeholder="搜索短剧、帖子、题材…"
             className="flex-1 min-w-0 bg-transparent text-[13.5px] text-on placeholder-dim outline-none" />
-          {q && <button type="button" onClick={() => { setQ(""); setSubmitted(""); setItems([]); }} className="w-5 h-5 rounded-full bg-s4 flex items-center justify-center text-mut pressable"><IClose size={11} /></button>}
+          {q && <button type="button" onClick={() => { seqRef.current++; busy.current = false; setLoading(false); setQ(""); setSubmitted(""); setItems([]); setPosts([]); }} className="w-5 h-5 rounded-full bg-s4 flex items-center justify-center text-mut pressable"><IClose size={11} /></button>}
         </form>
         <button onClick={() => push({ kind: "ranks" })} aria-label="排行榜"
           className="w-11 h-11 rounded-(--r-sm) flex items-center justify-center bg-primary text-on-primary pressable elev-2">
@@ -79,6 +120,25 @@ export default function Search({ active, wide }: { active: boolean; wide: boolea
       <div className="flex-1 scroll-y px-4 pb-24">
         {!querying ? (
           <>
+            {hotWords.length > 0 && (
+              <div className="mt-1 rounded-(--r-md) bg-s2 p-3.5 a-rise">
+                <div className="flex items-center justify-between">
+                  <span className="flex items-center gap-1.5 text-[13px] font-semibold text-on/90"><IFireF size={15} className="text-primary" />热搜榜</span>
+                  <button onClick={refreshHot} className="flex items-center gap-1 text-[11px] text-mut pressable"><IRefresh size={12} />刷新</button>
+                </div>
+                <div className="grid grid-cols-2 gap-x-3 gap-y-2 mt-3">
+                  {hotWords.slice(0, 10).map((h, i) => (
+                    <button key={h.word} onClick={() => { setQ(h.word); submit(h.word); }}
+                      className="flex items-center gap-2 min-w-0 text-left pressable">
+                      <span className={`w-4.5 h-4.5 shrink-0 rounded-(--r-xs) flex items-center justify-center text-[10.5px] font-bold ${i < 3 ? "bg-primary text-on-primary" : "bg-s3 text-dim"}`}>{i + 1}</span>
+                      <span className="truncate text-[12px] text-on/85 flex-1">{h.word}</span>
+                      <span className="text-[10px] text-dim shrink-0">{fmt(h.heat)}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
             {searchHist.length > 0 && (
               <div className="mt-1 a-rise">
                 <div className="flex items-center justify-between">
@@ -117,10 +177,36 @@ export default function Search({ active, wide }: { active: boolean; wide: boolea
           </>
         ) : (
           <>
-            <div className="text-[11.5px] text-mut mt-1 mb-2.5">「{submitted}」共 <span className="text-primary font-bold">{items.length}</span> 条结果</div>
-            {items.length ? (
+            <div className="flex gap-1 p-1 rounded-(--r-ctl) bg-s3 mt-1 mb-3">
+              {([["video", "视频"], ["post", "帖子"]] as const).map(([k, label]) => (
+                <button key={k} onClick={() => changeTab(k)}
+                  className={`flex-1 h-8 rounded-(--r-sm) text-[12px] font-semibold pressable ${tab === k ? "tonal text-on-sec" : "text-mut"}`}
+                  style={tab === k ? { background: "var(--p-sec)", color: "var(--p-primary)" } : undefined}>{label}</button>
+              ))}
+            </div>
+            <div className="text-[11.5px] text-mut mb-2.5">「{submitted}」共 <span className="text-primary font-bold">{tab === "video" ? items.length : posts.length}</span> 条结果</div>
+            {(tab === "video" ? items.length : posts.length) ? (
               <>
-                <Masonry videos={items} wide={wide} onOpen={(v) => push({ kind: "feed", videoIds: items.map((x) => x.id), index: items.findIndex((x) => x.id === v.id), title: `搜索 · ${submitted}` })} />
+                {tab === "video" ? (
+                  <Masonry videos={items} wide={wide} onOpen={(v) => push({ kind: "feed", videoIds: items.map((x) => x.id), index: items.findIndex((x) => x.id === v.id), title: `搜索 · ${submitted}` })} />
+                ) : (
+                  <div className={`${wide ? "columns-3 xl:columns-4" : "columns-2"} gap-2`}>
+                    {posts.map((post) => (
+                      <button key={post.id} onClick={() => push({ kind: "post", id: post.id })}
+                        className="w-full break-inside-avoid mb-2 relative rounded-(--r-sm) overflow-hidden bg-s1 elev-1 pressable block"
+                        style={{ paddingTop: "128%" }}>
+                        <Img src={post.cover} />
+                        <div className="absolute inset-x-0 bottom-0 h-2/3 bg-gradient-to-t from-black/90 via-black/40 to-transparent" />
+                        <div className="absolute inset-x-0 bottom-0 p-2">
+                          <div className="text-[11.5px] font-medium text-white clamp-2 leading-snug tsh">{post.title}</div>
+                          <div className="flex items-center gap-1 mt-1 text-[9.5px] text-white/70">
+                            <IFireF size={10} className="text-white/70" />{fmt(post.hot)}
+                          </div>
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                )}
                 <div className="flex justify-center py-4">
                   {loading ? <div className="w-6 h-6 spinner" />
                     : page < pages ? (

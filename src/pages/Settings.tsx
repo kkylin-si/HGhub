@@ -2,26 +2,18 @@ import { useEffect, useState, type ReactNode } from "react";
 import { api, APP_VERSION, hostOf, logLine, platform, type UpdateInfo } from "../api";
 import { useStore } from "../store";
 import { Modal, Toggle } from "../components/ui";
-import LinePicker from "../components/LinePicker";
-import { copyPlaybackLog, initPlaybackLog, setPlaybackLog, usePlaybackLog } from "../playbackDiagnostics";
+import { copyPlaybackLog, initPlaybackLog, setPlaybackLog, tracePlayback, usePlaybackLog } from "../playbackDiagnostics";
+import { formatNetDiag, shortVerdict } from "../netDiagReport";
+import { copyText } from "../clipboard";
 import { IBack, IBoltF, IBroom, IChevR, IHeart, IInfo, ILink, ILockF, IMoon, IRefresh, ISettings, ISun, IVolMute } from "../icons";
-
-const Section = ({ title, children }: { title: string; children: ReactNode }) => (
-    <>
-      <div className="text-[10.5px] font-semibold text-dim tracking-wide px-1 mt-4 mb-1.5">{title}</div>
-      <div className="rounded-(--r-md) bg-s2 divide-y divide-s3">{children}</div>
-    </>
-  );
 
 /* 独立设置页：线路 / 外观 / 播放 / 本地数据 / 清理缓存 / 网络诊断 / 关于
    入口：Windows 侧栏「设置」、Android「我的」右上角齿轮 */
 export default function Settings({ onBack, wide }: { onBack: () => void; wide: boolean }) {
-  const { theme, setTheme, favs, history, muteOnStartup, setMuteOnStartup, strictSecurity, strictSecurityReady, securityPending, cliRelaxed, setStrictSecurity, toast } = useStore();
+  const { theme, setTheme, favs, history, muteOnStartup, setMuteOnStartup, subtitlesEnabled, setSubtitlesEnabled, preferHevc, setPreferHevc, strictSecurity, strictSecurityReady, securityPending, cliRelaxed, setStrictSecurity, toast } = useStore();
   const [about, setAbout] = useState(false);
   const [clearOpen, setClearOpen] = useState(false);
   const [clearing, setClearing] = useState(false);
-  const [lineOpen, setLineOpen] = useState(false);
-  const [lineBase, setLineBase] = useState("");
   const [cacheLimit, setCacheLimit] = useState("");
   const [cacheBytes, setCacheBytes] = useState(0);
   const [cacheReady, setCacheReady] = useState(false);
@@ -31,13 +23,14 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
   const [cidrsSaving, setCidrsSaving] = useState(false);
   const [checking, setChecking] = useState(false);
   const [update, setUpdate] = useState<UpdateInfo | null>(null);
+  /** 应用内更新进行到哪一步（空串=没在更新） */
+  const [updating, setUpdating] = useState("");
   const playbackLog = usePlaybackLog();
   const [copyingLog, setCopyingLog] = useState(false);
+  const [diagnosing, setDiagnosing] = useState(false);
+  const [diagReport, setDiagReport] = useState<string | null>(null);
+  const [copyingReport, setCopyingReport] = useState(false);
 
-  const readLine = () => {
-    api.lineState().then((s) => setLineBase(s.base)).catch(() => {});
-  };
-  useEffect(readLine, []);
   useEffect(() => {
     api.playbackCacheStatus().then(({ max_mib, bytes }) => { setCacheLimit(String(max_mib)); setCacheBytes(bytes); setCacheReady(true); })
       .catch(() => toast("无法读取播放缓存设置", "info"));
@@ -55,6 +48,8 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
     return () => { mounted = false; window.clearInterval(timer); };
   }, []);
 
+
+
   const checkUpdate = async () => {
     setChecking(true);
     try {
@@ -67,7 +62,31 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
       setChecking(false);
     }
   };
+  /** 更新：用系统浏览器打开下载页，由系统/浏览器完成下载与安装。
+   *
+   * 不再自己下载 APK 并调安装器 —— 那条路在安卓上要额外过 FileProvider
+   * 与「安装未知应用」授权，失败点多，体验并不比浏览器好。
+   */
+  const doUpdate = async () => {
+    if (!update) return;
+    setUpdating("打开中…");
+    try {
+      await api.openUrl(update.url);
+    } catch (e) {
+      await copyText(update.url)
+        .then(() => toast("下载地址已复制，可在浏览器粘贴打开", "ok"))
+        .catch(() => toast((e as Error).message || "打开失败", "info"));
+    } finally {
+      setUpdating("");
+    }
+  };
 
+  const Section = ({ title, children }: { title: string; children: ReactNode }) => (
+    <>
+      <div className="text-[10.5px] font-semibold text-dim tracking-wide px-1 mt-4 mb-1.5">{title}</div>
+      <div className="rounded-(--r-md) bg-s2 divide-y divide-s3">{children}</div>
+    </>
+  );
 
   return (
     <div className="absolute inset-0 bg-bg flex flex-col">
@@ -109,6 +128,23 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
               </div>
               <Toggle on={muteOnStartup} onChange={setMuteOnStartup} label="启动时静音" />
             </div>
+            <div className="flex items-center gap-3 px-3.5 py-3">
+              <span className="w-8 h-8 rounded-full bg-s3 flex items-center justify-center text-primary"><IBoltF size={16} /></span>
+              <div className="flex-1 min-w-0">
+                <div className="text-[12.5px] text-on">优先高清</div>
+                <div className="text-[10.5px] text-mut">有高清就用 HEVC，播不了会自动切回标准</div>
+              </div>
+              <Toggle on={preferHevc} onChange={setPreferHevc} label="优先高清" />
+            </div>
+          </Section>
+
+          <Section title="字幕">
+            <div className="flex items-center justify-between px-3.5 py-3">
+              <span className="text-[12.5px] text-on">显示字幕</span>
+              <Toggle on={subtitlesEnabled} onChange={setSubtitlesEnabled} label="显示字幕" />
+            </div>
+          </Section>
+          <Section title="播放缓存">
             <div className="px-3.5 py-3">
               <label htmlFor="playback-cache-size" className="text-[12.5px] text-on">播放磁盘缓存上限（MiB）</label>
               <div className="text-[10.5px] text-mut mt-1">0 为关闭并删除播放磁盘缓存；开启时填写 128–4096 的整数。当前占用 {(cacheBytes / 1048576).toFixed(1)} MiB。</div>
@@ -137,21 +173,21 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
               <span className="w-8 h-8 rounded-full bg-s3 flex items-center justify-center text-primary"><IBroom size={16} /></span>
               <div className="flex-1">
                 <div className="text-[12.5px] text-on">清理缓存</div>
-                <div className="text-[10.5px] text-mut">封面和播放缓存</div>
+                <div className="text-[10.5px] text-mut">封面 / 播放缓存与本地记录</div>
               </div>
               <IChevR size={15} className="text-mut" />
             </button>
           </Section>
 
           <Section title="网络">
-            <button onClick={() => setLineOpen(true)} className="w-full flex items-center gap-3 px-3.5 py-3 text-left pressable">
+            <div className="flex items-center gap-3 px-3.5 py-3">
               <span className="w-8 h-8 rounded-full bg-s3 flex items-center justify-center text-primary"><IBoltF size={16} /></span>
               <div className="flex-1 min-w-0">
-                <div className="text-[12.5px] text-on">线路</div>
-                <div className="text-[10.5px] text-mut truncate">{lineBase ? hostOf(lineBase) : "固定线路 1（默认）"}</div>
+                <div className="text-[12.5px] text-on">播放源</div>
+                <div className="text-[10.5px] text-mut truncate">固定 huangguoai.com</div>
               </div>
-              <IChevR size={15} className="text-mut" />
-            </button>
+              <span className="text-[10.5px] text-mint">已固定</span>
+            </div>
             <div className="flex items-center gap-3 px-3.5 py-3">
               <span className="w-8 h-8 rounded-full bg-s3 flex items-center justify-center text-primary"><ILockF size={15} /></span>
               <div className="flex-1 min-w-0">
@@ -187,20 +223,40 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
               </div>
             </div>}
             {/* 打不开时先点这里：把 DNS / 代理 / HTTP 结果复制给维护者 */}
-            <button onClick={async () => {
+            <button disabled={diagnosing} onClick={async () => {
+              setDiagnosing(true);
               try {
-                const text = JSON.stringify(await api.netDiag(), null, 2);
-                logLine(`[net_diag] ${text}`);
-                await navigator.clipboard?.writeText(text);
-                toast("网络诊断结果已复制", "ok");
+                const diag = await api.netDiag();
+                // 落盘走原始 JSON（便于脚本统计），复制给对方的是分段可读报告。
+                logLine(`[net_diag] ${JSON.stringify(diag)}`);
+                const http = (diag.http ?? {}) as { ms?: number; status?: number };
+                const dns = (diag.dns ?? {}) as { count?: number; has_fake_ip?: boolean };
+                const env = (diag.env ?? {}) as Record<string, unknown>;
+                tracePlayback("net.diag", {
+                  verdict: String(diag.verdict ?? ""),
+                  host: hostOf(String(diag.host ?? "")), http_status: http.status ?? null, http_ms: http.ms ?? null,
+                  dns_count: dns.count ?? null, fake_ip: dns.has_fake_ip ?? null,
+                  proxy: Object.values(env).some(Boolean), strict: strictSecurity,
+                });
+                const report = formatNetDiag(diag);
+                try {
+                  await copyText(report);
+                  toast(`诊断已复制 · ${shortVerdict(diag)}`, "ok");
+                } catch {
+                  setDiagReport(report);
+                  toast("诊断已完成，复制失败，可在报告中重试", "info");
+                }
               } catch (e) {
-                toast((e as Error).message || "诊断失败", "info");
+                const detail = e instanceof Error ? e.message : typeof e === "string" ? e : "请稍后重试";
+                toast(`网络诊断失败：${detail}`, "info");
+              } finally {
+                setDiagnosing(false);
               }
-            }} className="w-full flex items-center gap-3 px-3.5 py-3 text-left pressable">
+            }} className="w-full flex items-center gap-3 px-3.5 py-3 text-left pressable disabled:opacity-60">
               <span className="w-8 h-8 rounded-full bg-s3 flex items-center justify-center text-primary"><ILink size={16} /></span>
               <div className="flex-1">
-                <div className="text-[12.5px] text-on">网络诊断</div>
-                <div className="text-[10.5px] text-mut">检测 DNS / 系统代理 / 官网连通性</div>
+                <div className="text-[12.5px] text-on">{diagnosing ? "正在诊断…" : "网络诊断"}</div>
+                <div className="text-[10.5px] text-mut">DNS / TCP / 系统代理 / 官网连通性，一键复制带结论的报告</div>
               </div>
               <IChevR size={15} className="text-mut" />
             </button>
@@ -211,7 +267,7 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
               <span className="w-8 h-8 rounded-full bg-s3 flex items-center justify-center text-primary"><IInfo size={16} /></span>
               <div className="flex-1 min-w-0">
                 <div className="text-[12.5px] text-on">播放诊断日志</div>
-                <div className="text-[10.5px] text-mut">记录点击、拖动、切页和缓冲过程；复现问题后可关闭并复制日志</div>
+                <div className="text-[10.5px] text-mut">版本、平台、当前线路和播放失败原因始终记录；开关只额外记录拖动与缓冲细节</div>
                 {playbackLog.error && <div role="alert" className="text-[10.5px] text-danger">{playbackLog.error}</div>}
               </div>
               <Toggle label="播放诊断日志" on={playbackLog.enabled} disabled={!playbackLog.ready || playbackLog.pending}
@@ -226,7 +282,7 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
               <span className="w-8 h-8 rounded-full bg-s3 flex items-center justify-center text-primary"><ILink size={16} /></span>
               <div className="flex-1 min-w-0">
                 <div className="text-[12.5px] text-on">{copyingLog ? "正在复制…" : "复制播放诊断日志"}</div>
-                <div className="text-[10.5px] text-mut break-all">{playbackLog.path || "日志仅保存在本机"}</div>
+                <div className="text-[10.5px] text-mut break-all">含版本、平台、当前线路、播放失败原因，粘贴即完整{playbackLog.path ? ` · ${playbackLog.path}` : ""}</div>
               </div>
               <IChevR size={15} className="text-mut" />
             </button>
@@ -244,31 +300,48 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
             <button onClick={() => setAbout(true)} className="w-full flex items-center gap-3 px-3.5 py-3 text-left pressable">
               <span className="w-8 h-8 rounded-full bg-s3 flex items-center justify-center text-primary"><IInfo size={16} /></span>
               <div className="flex-1">
-                <div className="text-[12.5px] text-on">关于 HGhub</div>
+                <div className="text-[12.5px] text-on">关于 HGhubX</div>
                 <div className="text-[10.5px] text-mut">版本 {APP_VERSION} · 仅限非商业使用</div>
               </div>
               <IChevR size={15} className="text-mut" />
             </button>
           </Section>
 
-          <div className="text-center text-[10px] text-dim mt-5">HGhub {APP_VERSION} · {platform === "android" ? "Android" : platform === "ios" ? "iOS" : platform === "macos" ? "macOS" : platform === "linux" ? "Linux" : "Windows"} 客户端</div>
+          <div className="text-center text-[10px] text-dim mt-5">HGhubX {APP_VERSION} · {platform === "android" ? "Android" : platform === "ios" ? "iOS" : platform === "macos" ? "macOS" : platform === "linux" ? "Linux" : "Windows"} 客户端</div>
         </div>
       </div>
 
-      <LinePicker open={lineOpen} onClose={() => { setLineOpen(false); readLine(); }} />
+      <Modal open={diagReport !== null} onClose={() => setDiagReport(null)} width={520}>
+        <div className="p-5">
+          <h2 className="text-[14.5px] font-bold text-on">网络诊断报告</h2>
+          <p className="text-[12px] text-mut mt-2">诊断已完成，自动复制未成功。可以重试复制，或在下方选择报告文字。</p>
+          <textarea readOnly aria-label="网络诊断报告" value={diagReport ?? ""}
+            className="w-full h-64 mt-3 p-3 rounded-(--r-sm) bg-s3 text-[11px] text-on resize-none" />
+          <div className="flex gap-2 mt-4">
+            <button onClick={() => setDiagReport(null)} className="flex-1 h-9 rounded-(--r-ctl) bg-s3 text-[12.5px] text-on pressable">关闭</button>
+            <button disabled={copyingReport} onClick={async () => {
+              if (diagReport === null) return;
+              setCopyingReport(true);
+              try { await copyText(diagReport); toast("网络诊断报告已复制", "ok"); setDiagReport(null); }
+              catch { toast("复制失败，请选择报告文字手动复制", "info"); }
+              finally { setCopyingReport(false); }
+            }} className="flex-1 h-9 rounded-(--r-ctl) brand-grad text-[12.5px] pressable disabled:opacity-60">{copyingReport ? "正在复制…" : "复制报告"}</button>
+          </div>
+        </div>
+      </Modal>
 
       <Modal open={about} onClose={() => setAbout(false)} width={392}>
         <div className="p-5">
           <div className="flex items-center gap-3">
             <span className="w-11 h-11 rounded-(--r-sm) brand-grad glow-neon flex items-center justify-center text-on-primary text-[17px] font-black">H</span>
             <div>
-              <div className="text-[16px] font-bold text-on leading-tight">HGhub</div>
-              <div className="text-[11px] text-mut mt-0.5">黄果短剧 · 第三方客户端 v{APP_VERSION}</div>
+              <div className="text-[16px] font-bold text-on leading-tight">HGhubX</div>
+              <div className="text-[11px] text-mut mt-0.5">HGhubX 客户端 v{APP_VERSION}</div>
             </div>
           </div>
 
           <p className="text-[12px] text-on/70 leading-relaxed mt-4">
-            基于 Rust + Tauri 2 构建的跨平台客户端，支持 Windows、macOS、Android 与 Linux。
+            基于 Rust + Tauri 2 构建的跨平台客户端，支持 Windows、macOS、Linux、Android 与 iOS。
             界面遵循 Fluent 设计语言，播放器采用沉浸式竖屏信息流。
           </p>
 
@@ -278,13 +351,13 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
           </div>
 
           <div className="mt-4 divide-y divide-s3">
-            <button onClick={() => { navigator.clipboard?.writeText("https://github.com/Minireel/HGhub").then(() => toast("仓库地址已复制", "ok")).catch(() => {}); }}
+            <button onClick={() => { api.openUrl("https://github.com/zxsos/HGhubX").catch(() => { copyText("https://github.com/zxsos/HGhubX").then(() => toast("仓库地址已复制", "ok")).catch(() => {}); }); }}
               className="w-full flex items-center gap-2 py-2.5 text-left pressable">
               <ILink size={15} className="text-mut" />
-              <span className="text-[12px] text-on/85">github.com/Minireel/HGhub</span>
+              <span className="text-[12px] text-on/85">github.com/zxsos/HGhubX</span>
               <span className="ml-auto text-[10.5px] text-primary">复制</span>
             </button>
-            <button onClick={() => { navigator.clipboard?.writeText("https://huangguoai.com").then(() => toast("站点地址已复制", "ok")).catch(() => {}); }}
+            <button onClick={() => { copyText("https://huangguoai.com").then(() => toast("站点地址已复制", "ok")).catch(() => {}); }}
               className="w-full flex items-center gap-2 py-2.5 text-left pressable">
               <ILink size={15} className="text-mut" />
               <span className="text-[12px] text-on/85">huangguoai.com</span>
@@ -305,19 +378,16 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
         <div className="p-5">
           <div className="text-[14.5px] font-bold text-on">清理缓存</div>
           <p className="text-[12px] text-mut leading-relaxed mt-2">
-            清除封面、播放列表、分片、密钥及磁盘播放缓存。收藏、观看记录、搜索历史与登录状态都会保留。
+            只清除封面与播放列表缓存（解密图 / m3u8）。收藏、观看记录、搜索历史与登录状态都会保留。
           </p>
           <div className="flex gap-2 mt-5">
             <button onClick={() => setClearOpen(false)} className="flex-1 h-9 rounded-(--r-ctl) bg-s3 text-[12.5px] text-on/80 pressable">取消</button>
             <button disabled={clearing} onClick={async () => {
               setClearing(true);
-              try {
-                await api.clearCache();
-                setCacheBytes(0);
-                setClearOpen(false);
-                toast("缓存已清理", "ok");
-              } catch (e) { toast((e as Error).message || "缓存清理失败", "info"); }
-              finally { setClearing(false); }
+              try { await api.clearCache(); } catch { /* 忽略 */ }
+              setClearing(false);
+              setClearOpen(false);
+              toast("缓存已清理", "ok");
             }} className="flex-1 h-9 rounded-(--r-ctl) bg-primary text-[12.5px] font-semibold text-on-primary pressable disabled:opacity-60">
               {clearing ? "清理中…" : "确定清理"}
             </button>
@@ -336,13 +406,12 @@ export default function Settings({ onBack, wide }: { onBack: () => void; wide: b
             <div className="mt-3 max-h-[180px] scroll-y rounded-(--r-sm) bg-s2 p-3 text-[11px] text-mut whitespace-pre-wrap leading-relaxed">{update.notes}</div>
           )}
           <div className="flex gap-2 mt-4">
-            <button onClick={() => setUpdate(null)} className="flex-1 h-9 rounded-(--r-ctl) bg-s3 text-[12.5px] text-on/80 pressable">稍后</button>
-            <button onClick={() => {
-              if (!update) return;
-              api.openUrl(update.url).catch(() => {
-                navigator.clipboard?.writeText(update.url).then(() => toast("下载地址已复制", "ok")).catch(() => {});
-              });
-            }} className="flex-1 h-9 rounded-(--r-ctl) bg-primary text-[12.5px] font-semibold text-on-primary pressable">前往下载</button>
+            <button onClick={() => setUpdate(null)} disabled={!!updating}
+              className="flex-1 h-9 rounded-(--r-ctl) bg-s3 text-[12.5px] text-on/80 pressable disabled:opacity-60">稍后</button>
+            <button onClick={() => void doUpdate()} disabled={!!updating}
+              className="flex-1 h-9 rounded-(--r-ctl) bg-primary text-[12.5px] font-semibold text-on-primary pressable disabled:opacity-60">
+              {updating || "前往下载"}
+            </button>
           </div>
           <div className="text-[10px] text-dim mt-2.5 break-all">{update?.url}</div>
         </div>

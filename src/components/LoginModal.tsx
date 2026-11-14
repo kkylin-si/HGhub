@@ -38,7 +38,7 @@ export default function LoginModal() {
     <div className="p-5">
       <div className="flex items-center gap-2 mb-3">
         <span className="w-8 h-8 rounded-(--r-sm) bg-pc text-on-pc flex items-center justify-center"><ILogin size={16} /></span>
-        <span className="text-[15px] font-bold text-on">{mode === "login" ? "登录 HGhub" : "注册 HGhub"}</span>
+        <span className="text-[15px] font-bold text-on">{mode === "login" ? "登录 HGhubX" : "注册 HGhubX"}</span>
         <button onClick={() => setLoginOpen(false)} className="ml-auto w-7 h-7 rounded-full bg-s4 flex items-center justify-center text-mut pressable">
           <IClose size={13} />
         </button>
@@ -68,7 +68,7 @@ export default function LoginModal() {
         </button>
       </div>
       <p className="text-[10.5px] text-dim mt-3 leading-relaxed">
-        使用黄果短剧官网账号登录。登录、注册仅支持固定线路；镜像线路请以游客浏览。
+        使用 HGhubX 账号登录。登录、注册仅支持固定线路；镜像线路请以游客浏览。
       </p>
     </div>
   );

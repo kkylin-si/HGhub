@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "HGhub",
-  "version": "1.2.1",
-  "identifier": "com.hghub.huangguo",
+  "productName": "HGhubX",
+  "version": "1.3.0",
+  "identifier": "com.hghubx.app",
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://localhost:1420",
@@ -13,12 +13,13 @@
     "windows": [
       {
         "label": "main",
-        "title": "HGhub",
+        "title": "HGhubX",
         "width": 1200,
         "height": 780,
         "minWidth": 900,
         "minHeight": 620,
         "decorations": false,
+        "backgroundColor": "#1a1a1a",
         "transparent": false,
         "resizable": true,
         "center": true
@@ -32,9 +33,7 @@
   "bundle": {
     "active": true,
     "targets": [
-      "nsis",
-      "deb",
-      "appimage"
+      "nsis"
     ],
     "icon": [
       "icons/32x32.png",
@@ -44,10 +43,8 @@
       "icons/icon.ico"
     ],
     "android": {
-      "minSdkVersion": 24
-    },
-    "iOS": {
-      "developmentTeam": "ABCDE12345"
+      "minSdkVersion": 24,
+      "versionCode": 1002019
     }
   }
 }

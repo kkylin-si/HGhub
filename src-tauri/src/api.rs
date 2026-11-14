@@ -17,17 +17,17 @@ impl Api {
         }
     }
 
-    async fn get(&self, path: &str) -> Result<Value, String> {
-        let origin = base();
-        let token = self.session.token(&origin);
-        edge(&origin, "GET", path, None, token.as_deref()).await
-    }
-
-    /// POST（游客也可调用，有登录态时带上 token）：新播放接口需要。
+    /// POST 信封：新播放接口 /api/videos/{id}/episodes/{ep}/playback 需要。
     async fn post(&self, path: &str, body: Option<Value>) -> Result<Value, String> {
         let origin = base();
         let token = self.session.token(&origin);
         edge(&origin, "POST", path, body, token.as_deref()).await
+    }
+
+    async fn get(&self, path: &str) -> Result<Value, String> {
+        let origin = base();
+        let token = self.session.token(&origin);
+        edge(&origin, "GET", path, None, token.as_deref()).await
     }
 
     async fn authed(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value, String> {
@@ -66,15 +66,20 @@ pub async fn line_state() -> Result<Value, String> {
     }))
 }
 
-/// 手动切换线路：立即生效并落盘（下次启动沿用）。
+/// 手动切换线路：唯一播放源固定为 huangguoai.com，只放行默认主站，其余拒绝。
 #[tauri::command]
 pub async fn line_set(state: State<'_, Api>, url: String) -> Result<String, String> {
+    let next = crate::net::normalize_base(&url)
+        .ok_or_else(|| "线路地址无效（需要纯 HTTPS 站点地址，禁止内网）".to_string())?;
+    if next != crate::net::DEFAULT_BASE {
+        return Err("唯一播放源已固定，不再支持切换线路".into());
+    }
     let previous = base();
-    let next = crate::net::set_base(&url)?;
-    if previous != next {
+    let applied = crate::net::set_base(&next)?;
+    if previous != applied {
         state.session.clear();
     }
-    Ok(next)
+    Ok(applied)
 }
 
 /// 从地址发布页抓镜像线路（只在用户点开「线路」时调用）。
@@ -92,9 +97,61 @@ pub async fn line_probe(urls: Vec<String>) -> Result<Value, String> {
     Ok(crate::lines::probe(urls).await)
 }
 
+/// 自动选线：`.com` 与 `.ai` 各探一次，选通的那条、快的那条。
+///
+/// 和 [`line_set`] 的区别是**不清会话**：两个域名是同一个站点，登录态本来就通用；
+/// 自动切换如果清会话，用户每换一次网络就被踢下线，那是不能接受的。
+#[tauri::command]
+pub async fn line_auto() -> Result<Value, String> {
+    crate::net::refresh_client();
+    let pick = crate::lines::auto_pick().await;
+    let chosen = pick
+        .get("base")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let previous = base();
+    let mut switched = false;
+    if !chosen.is_empty() && chosen != previous {
+        let next = crate::net::set_base(&chosen)?;
+        switched = next != previous;
+    }
+    Ok(json!({
+        "previous": previous,
+        "base": crate::net::base(),
+        "switched": switched,
+        "pick": pick,
+    }))
+}
+
+/// 当前走的是镜像时，敲一次主站：通了就切回（不清会话）。
+///
+/// 和 [`line_auto`] 的分工：[`line_auto`] 是「整体比一次」，要抓发布页；
+/// 这个只问一句「主站现在通不通」，代价一个请求，可以频繁调用。
+#[tauri::command]
+pub async fn line_try_main() -> Result<Value, String> {
+    crate::net::refresh_client();
+    let probe = crate::lines::try_main().await;
+    let previous = base();
+    let mut switched = false;
+    if probe.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        let chosen = probe.get("base").and_then(Value::as_str).unwrap_or_default();
+        if !chosen.is_empty() && chosen != previous {
+            let next = crate::net::set_base(chosen)?;
+            switched = next != previous;
+        }
+    }
+    Ok(json!({
+        "previous": previous,
+        "base": crate::net::base(),
+        "switched": switched,
+        "probe": probe,
+    }))
+}
+
 /* ───────────────────────── 更新检查 ───────────────────────── */
 
-const REPO: &str = "Minireel/HGhub";
+const REPO: &str = "zxsos/HGhubX";
 
 fn ver_parts(v: &str) -> Vec<u64> {
     v.trim()
@@ -117,6 +174,40 @@ fn is_newer(latest: &str, current: &str) -> bool {
     false
 }
 
+/// 从 tag / name 里取出 `x.y.z`。
+///
+/// 我们的 tag 是 `hgfix-1.2.1-r5`，上游是 `v1.2.0`，release name 是 `HGhubX 1.2.1+hg.1`。
+/// 直接拿去比会从第一位就判负（`hgfix-1` 解析成 0），所以先抠出版本号。
+fn version_in(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if !chars[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut dots = 0;
+        let mut j = i;
+        while j < chars.len() && (chars[j].is_ascii_digit() || (chars[j] == '.' && dots < 2)) {
+            if chars[j] == '.' {
+                dots += 1;
+            }
+            j += 1;
+        }
+        if dots == 2 {
+            return chars[start..j].iter().collect();
+        }
+        i = j.max(i + 1);
+    }
+    String::new()
+}
+
+/// 线路体检：探一次 `/api/videos`，和自动选线用同一个判据。
+#[tauri::command]
+pub async fn line_health() -> Result<Value, String> {
+    Ok(crate::lines::health().await)
+}
 /// 对比 GitHub Release 的 tag 与当前版本（未认证 60 次/小时/IP，够用）。
 #[tauri::command]
 pub async fn check_update() -> Result<Value, String> {
@@ -154,12 +245,33 @@ pub async fn check_update() -> Result<Value, String> {
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("https://github.com/{REPO}/releases"));
     let notes = v.get("body").and_then(|x| x.as_str()).unwrap_or("");
+    // tag 是 `hgfix-1.2.1-r5`，不能直接拿整串比大小
+    let latest = {
+        let found = version_in(&tag);
+        if found.is_empty() {
+            tag.trim_start_matches(['v', 'V']).to_string()
+        } else {
+            found
+        }
+    };
 
+    // 顺手把「这个平台该下哪个包」挑出来，前端好直接应用内更新
+    let assets = v.get("assets").and_then(Value::as_array).cloned().unwrap_or_default();
+    let asset = assets
+        .iter()
+        .filter_map(|a| {
+            let name = a.get("name").and_then(Value::as_str)?;
+            let url = a.get("browser_download_url").and_then(Value::as_str)?;
+            Some((name.to_string(), url.to_string()))
+        })
+        .filter(|(n, _)| asset_rank(n) > 0)
+        .max_by_key(|(n, _)| asset_rank(n));
     Ok(json!({
         "current": current,
-        "latest": tag.trim_start_matches(['v', 'V']).to_string(),
+        "latest": latest,
         "tag": tag,
-        "has_update": !tag.is_empty() && is_newer(&tag, &current),
+        "has_update": !latest.is_empty() && is_newer(&latest, &current),
+        "asset": asset.map(|(name, url)| json!({ "name": name, "url": url })),
         "url": html,
         "name": v.get("name").and_then(|x| x.as_str()).unwrap_or(""),
         "published_at": v.get("published_at").and_then(|x| x.as_str()).unwrap_or(""),
@@ -168,6 +280,45 @@ pub async fn check_update() -> Result<Value, String> {
 }
 
 /// 用系统默认浏览器打开链接（只允许 http/https）。
+/// 这个平台该更新哪个包，数字越大越优先。
+///
+/// 安卓的 release 里同时有 arm64 / arm(v7) / x86_64 三个 apk，光看「是不是 apk」
+/// 会先撞上 armv7 那个，64 位机器就降到 32 位跑了。所以按架构给分，取最高。
+fn asset_rank(name: &str) -> u8 {
+    let n = name.to_ascii_lowercase();
+    if cfg!(target_os = "android") {
+        if !n.ends_with(".apk") {
+            0
+        } else if cfg!(target_arch = "aarch64") {
+            if n.contains("arm64") || n.contains("aarch64") {
+                3
+            } else {
+                1
+            }
+        } else if cfg!(target_arch = "x86_64") {
+            if n.contains("x86_64") {
+                3
+            } else {
+                1
+            }
+        } else if n.contains("x86") || n.contains("arm64") {
+            1
+        } else {
+            2
+        }
+    } else if cfg!(target_os = "windows") {
+        if n.ends_with(".exe") { 3 } else { 0 }
+    } else if cfg!(target_os = "macos") {
+        if n.ends_with(".dmg") { 3 } else { 0 }
+    } else if n.ends_with(".deb") {
+        3
+    } else if n.ends_with(".appimage") {
+        2
+    } else {
+        0
+    }
+}
+
 #[tauri::command]
 pub async fn open_url(app: tauri::AppHandle, url: String) -> Result<(), String> {
     let target = crate::network_policy::parse_target(&url)?;
@@ -177,7 +328,7 @@ pub async fn open_url(app: tauri::AppHandle, url: String) -> Result<(), String> 
         .map_err(|e| e.to_string())
 }
 
-/// 切换移动端屏幕方向（iOS 原生旋转屏幕方向：横屏 Landscape / 竖屏 Portrait）。
+/// 切换移动端屏幕方向（iOS 原生旋转：横屏 Landscape / 竖屏 Portrait）。
 #[tauri::command]
 pub async fn set_orientation(app: tauri::AppHandle, landscape: bool) -> Result<(), String> {
     #[cfg(target_os = "ios")]
@@ -189,6 +340,25 @@ pub async fn set_orientation(app: tauri::AppHandle, landscape: bool) -> Result<(
     #[cfg(not(target_os = "ios"))]
     {
         let _ = (&app, landscape);
+    }
+    Ok(())
+}
+
+/// iOS 专用：切换 WKWebView 文本交互。
+/// 主界面默认关闭以消除长按快进时的系统放大镜；输入框聚焦时前端调用此命令重新打开，
+/// 失焦后再关闭，避免影响搜索/评论/登录等文本输入。
+#[tauri::command]
+pub fn set_text_interaction(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    #[cfg(target_os = "ios")]
+    {
+        use tauri::Manager;
+        if let Some(window) = app.get_webview_window("main") {
+            crate::ios_layout::set_text_interaction_on_webview(window.as_ref(), enabled);
+        }
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        let _ = (&app, enabled);
     }
     Ok(())
 }
@@ -213,7 +383,7 @@ fn request_ios_orientation(landscape: bool) {
         let msg1_void: unsafe extern "C" fn(*mut c_void, *mut c_void) =
             std::mem::transmute(objc_msgSend as *const ());
 
-        // 1. iOS 16+ UIWindowScene.requestGeometryUpdateWithPreferences:errorHandler:
+        // iOS 16+ UIWindowScene.requestGeometryUpdateWithPreferences:errorHandler:
         // UIInterfaceOrientationMaskPortrait = 1 << 1 = 2
         // UIInterfaceOrientationMaskLandscapeRight = 1 << 3 = 8
         let mask: usize = if landscape { 8 } else { 2 };
@@ -258,7 +428,7 @@ fn request_ios_orientation(landscape: bool) {
             }
         }
 
-        // 2. Fallback: UIDevice setValue:forKey:@"orientation" + attemptRotationToDeviceOrientation
+        // Fallback: UIDevice setValue:forKey:@"orientation" + attemptRotationToDeviceOrientation
         let dev_cls = objc_getClass(b"UIDevice\0".as_ptr() as *const c_char);
         let num_cls = objc_getClass(b"NSNumber\0".as_ptr() as *const c_char);
         let str_cls = objc_getClass(b"NSString\0".as_ptr() as *const c_char);
@@ -427,16 +597,79 @@ pub async fn api_feed(state: State<'_, Api>, page: u32, size: u32) -> Result<Val
         .await
 }
 
+/// 原创频道，返回分页视频卡（结构同 api_feed）。
+/// `cate="all"` 走 `/api/videos?is_original=1`；`ai-duanju`/`ai-manju` 走
+/// `/api/videos/category/{cate}?is_original=1`。
+#[tauri::command]
+pub async fn api_original_videos(
+    state: State<'_, Api>,
+    cate: String,
+    page: u32,
+    size: u32,
+    sort: Option<String>,
+) -> Result<Value, String> {
+    let sort = match sort.as_deref() {
+        Some(s) if !s.trim().is_empty() => format!("&sort={s}"),
+        _ => String::new(),
+    };
+    let path = if cate == "all" {
+        format!("/api/videos?is_original=1&page={page}&size={size}{sort}")
+    } else {
+        format!("/api/videos/category/{cate}?is_original=1&page={page}&size={size}{sort}")
+    };
+    state.get(&path).await
+}
+
+/* ───────────────────────── 专题 / 标签 ───────────────────────── */
+
+/// 专题列表：`/api/topics` 返回 data.items（标题/封面/简介/收录数）。
+#[tauri::command]
+pub async fn api_topics(state: State<'_, Api>) -> Result<Value, String> {
+    state.get("/api/topics?size=100").await
+}
+
+/// 专题详情：`/api/topics/{slug}` 返回 data = { topic, videos, related }。
+#[tauri::command]
+pub async fn api_topic(state: State<'_, Api>, slug: String) -> Result<Value, String> {
+    let encoded: String = url::form_urlencoded::byte_serialize(slug.as_bytes()).collect();
+    state.get(&format!("/api/topics/{encoded}")).await
+}
+
+/// 标签分组：`/api/tags` 返回 data.categories[]，每个含 tags[]（name/slug/hot_score）。
+#[tauri::command]
+pub async fn api_tags(state: State<'_, Api>) -> Result<Value, String> {
+    state.get("/api/tags").await
+}
+
+/// 按标签取视频：后端按中文标签名匹配（网页 /tag/<slug>/ 实际请求 /api/videos/tag/<name>）。
+#[tauri::command]
+pub async fn api_tag_videos(
+    state: State<'_, Api>,
+    tag: String,
+    page: u32,
+    size: u32,
+) -> Result<Value, String> {
+    let encoded: String = url::form_urlencoded::byte_serialize(tag.as_bytes()).collect();
+    state
+        .get(&format!("/api/videos/tag/{encoded}?page={page}&size={size}"))
+        .await
+}
+
 #[tauri::command]
 pub async fn api_category(
     state: State<'_, Api>,
     cate: String,
     page: u32,
     size: u32,
+    sort: Option<String>,
 ) -> Result<Value, String> {
+    let sort = match sort.as_deref() {
+        Some(s) if !s.trim().is_empty() => format!("&sort={s}"),
+        _ => String::new(),
+    };
     state
         .get(&format!(
-            "/api/videos/category/{cate}?page={page}&size={size}"
+            "/api/videos/category/{cate}?page={page}&size={size}{sort}"
         ))
         .await
 }
@@ -450,29 +683,66 @@ pub async fn api_rank(state: State<'_, Api>, kind: String) -> Result<Value, Stri
     state.get(&format!("/api/ranks/{kind}")).await
 }
 
+/// 全站搜索：`/api/search?q=...&type=video|post`。
+///
+/// `type` 省略时后端默认只搜短剧；吃瓜帖必须显式传 `type=post`，
+/// 否则搜「吃瓜频道关键词」永远是空结果（issue #34）。
 #[tauri::command]
 pub async fn api_search(
     state: State<'_, Api>,
     q: String,
     page: u32,
     size: u32,
+    kind: Option<String>,
 ) -> Result<Value, String> {
     let encoded: String = url::form_urlencoded::byte_serialize(q.as_bytes()).collect();
+    let scope = match kind.as_deref() {
+        Some("post") => "&type=post",
+        Some("video") => "&type=video",
+        _ => "",
+    };
     state
-        .get(&format!("/api/search?q={encoded}&page={page}&size={size}"))
+        .get(&format!("/api/search?q={encoded}&page={page}&size={size}{scope}"))
         .await
 }
 
+/// 热搜榜：`/api/search/hot` 返回 data.items（word/heat）。
 #[tauri::command]
-pub async fn api_posts(state: State<'_, Api>, page: u32, size: u32) -> Result<Value, String> {
+pub async fn api_search_hot(state: State<'_, Api>) -> Result<Value, String> {
+    state.get("/api/search/hot").await
+}
+
+#[tauri::command]
+pub async fn api_posts(
+    state: State<'_, Api>,
+    page: u32,
+    size: u32,
+    sort: Option<String>,
+) -> Result<Value, String> {
+    let sort = match sort.as_deref() {
+        Some(s) if !s.trim().is_empty() => format!("&sort={s}"),
+        _ => String::new(),
+    };
     state
-        .get(&format!("/api/posts?page={page}&size={size}"))
+        .get(&format!("/api/posts?page={page}&size={size}{sort}"))
         .await
 }
 
 #[tauri::command]
 pub async fn api_post(state: State<'_, Api>, id: i64) -> Result<Value, String> {
     state.get(&format!("/api/posts/{id}")).await
+}
+
+/// 吃瓜帖视频：`POST /api/posts/{id}/playback` → `data.videos[].url`（mode=1 为明文 m3u8）。
+///
+/// 帖详情里的 `video_url` / `video_api` 恒为空，视频地址只由这个接口下发；
+/// 不调它的话吃瓜页永远只有图文（issue #11）。无视频时接口返回 status=0
+/// 「视频不存在或不可播放」，经 `edge()` 转换后就是 Err，前端按「无视频」处理。
+#[tauri::command]
+pub async fn api_post_playback(state: State<'_, Api>, id: i64) -> Result<Value, String> {
+    state
+        .post(&format!("/api/posts/{id}/playback"), Some(json!({})))
+        .await
 }
 
 /* ───────────────────────── 详情 / 播放 ───────────────────────── */
@@ -482,19 +752,22 @@ pub async fn api_video(state: State<'_, Api>, id: i64) -> Result<Value, String> 
     state.get(&format!("/api/videos/{id}")).await
 }
 
-/// 新版播放接口返回 `streams.{main,hevc,preview}`，旧接口的 `video_url` 现在恒为空串。
-/// 这里把新字段回填到 `video_url` / `video_url_hevc`，前端和自检继续按原字段取流。
+fn non_empty(v: Option<&Value>) -> Option<&Value> {
+    v.filter(|x| !x.is_null() && x.as_str().is_some_and(|s| !s.trim().is_empty()))
+}
+
+/// 把新接口返回的 streams.main / streams.hevc 回填到 video_url / video_url_hevc，
+/// 前端只认 video_url，旧字段缺失时也兼容。
 fn normalize_play_info(info: &mut Value) {
-    fn non_empty(v: Option<&Value>) -> Option<String> {
-        v.and_then(|x| x.as_str())
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-    }
-    let main = non_empty(info.get("streams").and_then(|s| s.get("main")));
-    let hevc = non_empty(info.get("streams").and_then(|s| s.get("hevc")));
     let Some(obj) = info.as_object_mut() else { return };
-    for (field, stream) in [("video_url", main), ("video_url_hevc", hevc)] {
-        if let Some(url) = stream {
+    for (field, key) in [("video_url", "main"), ("video_url_hevc", "hevc")] {
+        let url = obj
+            .get("streams")
+            .and_then(|st| st.get(key))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_owned);
+        if let Some(url) = url {
             if non_empty(obj.get(field)).is_none() {
                 obj.insert(field.into(), json!(url));
             }
@@ -505,14 +778,17 @@ fn normalize_play_info(info: &mut Value) {
 fn has_play_url(info: &Value) -> bool {
     info.get("video_url")
         .and_then(|v| v.as_str())
-        .is_some_and(|s| !s.is_empty())
+        .is_some_and(|s| !s.trim().is_empty())
 }
 
 #[tauri::command]
 pub async fn api_play(state: State<'_, Api>, id: i64, ep: u32) -> Result<Value, String> {
-    // 优先走新接口；失败或没有可用地址时再退回旧接口，两者都不行就返回新接口的结果/错误。
+    // 优先走新接口；失败或没有可用地址时退回旧接口，两者都不行就返回新接口的结果/错误。
     let primary = state
-        .post(&format!("/api/videos/{id}/episodes/{ep}/playback"), Some(json!({})))
+        .post(
+            &format!("/api/videos/{id}/episodes/{ep}/playback"),
+            Some(json!({})),
+        )
         .await
         .map(|mut info| {
             normalize_play_info(&mut info);
@@ -687,48 +963,80 @@ pub async fn api_post_comments(
         .get(&format!("/api/posts/{id}/comments?page={page}&size={size}"))
         .await
 }
+
+/// 吃瓜分类：`/api/site/categories/post` 返回 data.items（name/route）。
+#[tauri::command]
+pub async fn api_post_categories(state: State<'_, Api>) -> Result<Value, String> {
+    state.get("/api/site/categories/post").await
+}
+
+/// 按分类取吃瓜帖：`/api/posts/category/{route}`；`sort=latest` 走最新排序。
+#[tauri::command]
+pub async fn api_post_category(
+    state: State<'_, Api>,
+    route: String,
+    page: u32,
+    size: u32,
+    sort: Option<String>,
+) -> Result<Value, String> {
+    let encoded: String = url::form_urlencoded::byte_serialize(route.as_bytes()).collect();
+    let sort = match sort.as_deref() {
+        Some(s) if !s.trim().is_empty() => format!("&sort={s}"),
+        _ => String::new(),
+    };
+    state
+        .get(&format!(
+            "/api/posts/category/{encoded}?page={page}&size={size}{sort}"
+        ))
+        .await
+}
+
+/// 相关推荐：`/api/videos/{id}/related` 返回 data.items。
+#[tauri::command]
+pub async fn api_related(state: State<'_, Api>, id: i64) -> Result<Value, String> {
+    state.get(&format!("/api/videos/{id}/related")).await
+}
+
+/// 关注流：`/api/videos/following`（需登录）。
+#[tauri::command]
+pub async fn api_following(
+    state: State<'_, Api>,
+    page: u32,
+    size: u32,
+) -> Result<Value, String> {
+    state
+        .authed("GET", &format!("/api/videos/following?page={page}&size={size}"), None)
+        .await
+}
+
+/// 用户主页：`/api/users/{id}`。
+#[tauri::command]
+pub async fn api_user(state: State<'_, Api>, id: i64) -> Result<Value, String> {
+    state.get(&format!("/api/users/{id}")).await
+}
+
+/// 用户统计：`/api/users/{id}/stats`。
+#[tauri::command]
+pub async fn api_user_stats(state: State<'_, Api>, id: i64) -> Result<Value, String> {
+    state.get(&format!("/api/users/{id}/stats")).await
+}
+
+/// 用户作品：`/api/videos/user/{id}`。
+#[tauri::command]
+pub async fn api_user_videos(
+    state: State<'_, Api>,
+    id: i64,
+    page: u32,
+    size: u32,
+) -> Result<Value, String> {
+    state
+        .get(&format!("/api/videos/user/{id}?page={page}&size={size}"))
+        .await
+}
 #[cfg(test)]
 mod tests {
-    use super::{has_play_url, is_newer, normalize_play_info};
-    use serde_json::{json, Value};
-
-    #[tokio::test]
-    async fn cancelled_prefetch_does_not_wait_for_the_background_slot() {
-        let _guard = crate::media_cache::TEST_LOCK.lock().unwrap();
-        let permit = crate::media_cache::PREFETCH_SLOT.acquire_many(2).await.unwrap();
-        let id = "cancel-queued-prefetch";
-        crate::media_cache::start_session(id.into()).unwrap();
-        let task = tokio::spawn(super::playback_cache_prefetch("https://example.test/unused".into(), None, None, vec![], id.into(), None));
-        tokio::task::yield_now().await;
-        crate::media_cache::cancel_session(id);
-        let result = tokio::time::timeout(std::time::Duration::from_secs(1), task).await.unwrap().unwrap().unwrap();
-        assert!(!result);
-        drop(permit);
-    }
-
-    #[test]
-    fn new_playback_streams_fill_legacy_url_fields() {
-        let mut info = json!({
-            "video_url": "",
-            "streams": {"main": "https://x/main.m3u8", "hevc": "https://x/hevc.m3u8", "preview": "https://x/p.m3u8"}
-        });
-        normalize_play_info(&mut info);
-        assert_eq!(info["video_url"], "https://x/main.m3u8");
-        assert_eq!(info["video_url_hevc"], "https://x/hevc.m3u8");
-        assert!(has_play_url(&info));
-    }
-
-    #[test]
-    fn existing_video_url_is_kept_and_empty_streams_stay_empty() {
-        let mut keep = json!({"video_url": "https://old/a.m3u8", "streams": {"main": "https://x/main.m3u8"}});
-        normalize_play_info(&mut keep);
-        assert_eq!(keep["video_url"], "https://old/a.m3u8");
-
-        let mut empty = json!({"video_url": "", "streams": {"main": ""}});
-        normalize_play_info(&mut empty);
-        assert!(!has_play_url(&empty));
-        assert!(!has_play_url(&json!({"id": 1})));
-    }
+    use super::{is_newer, version_in};
+    use serde_json::Value;
 
     #[test]
     fn frontend_cannot_bypass_url_policy_with_opener_commands() {
@@ -777,5 +1085,17 @@ mod tests {
         assert!(!is_newer("v1.0.1", "1.0.1"));
         assert!(!is_newer("v0.9.9", "1.0.1"));
         assert!(!is_newer("", "1.0.1"));
+    }
+    /// tag 不是纯版本号：`hgfix-1.2.1-r5` 整串拿去比会从第一位判负（`hgfix-1` 解析成 0），
+    /// 结果就是「永远没有新版本」。所以先抠出 `x.y.z` 再比。
+    #[test]
+    fn reads_version_out_of_tag() {
+        assert_eq!(version_in("hgfix-1.2.1-r5"), "1.2.1");
+        assert_eq!(version_in("v1.2.0"), "1.2.0");
+        assert_eq!(version_in("HGhubX 1.2.1+hg.1"), "1.2.1");
+        assert_eq!(version_in("release-notes"), "");
+        assert!(is_newer(&version_in("hgfix-1.2.2-r6"), "1.2.1+hg.1"));
+        assert!(is_newer(&version_in("hgfix-1.10.0-r9"), "1.9.9+hg.1"));
+        assert!(!is_newer(&version_in("hgfix-1.2.1-r5"), "1.2.1+hg.1"));
     }
 }

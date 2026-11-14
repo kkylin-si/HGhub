@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import { cover } from "../api";
 import { useStore } from "../store";
-import { ICheck, IClose, IHeartF, ISparkF, IStarF } from "../icons";
+import { IBoltF, ICheck, IClose, IGlobe, IHeartF, ISparkF, IStarF } from "../icons";
 
 /* ——— 头像 ——— */
 export function Avatar({ hue = 250, icon, name, size = 40, ring = false, className = "" }: {
@@ -95,15 +95,54 @@ export function ToastHost() {
   const { toasts } = useStore();
   return (
     <div className="absolute inset-x-0 z-[80] flex flex-col items-center gap-2 pointer-events-none px-6" style={{ bottom: "calc(var(--sab, 0px) + 96px)" }}>
-      {toasts.map((t) => (
-        <div key={t.id} className="a-toast pointer-events-auto flex items-center gap-2.5 max-w-full bg-s4/95 backdrop-blur-md rounded-(--r-sm) pl-3.5 pr-4 py-2.5 elev-3">
-          {t.icon === "ok" && <ICheck size={16} className="text-mint shrink-0" />}
-          {t.icon === "heart" && <IHeartF size={16} className="text-neon shrink-0" />}
-          {t.icon === "star" && <IStarF size={16} className="text-amber shrink-0" />}
-          {t.icon === "info" && <ISparkF size={15} className="text-cyan shrink-0" />}
-          <span className="text-[13px] text-on truncate">{t.msg}</span>
-        </div>
-      ))}
+      {toasts.map((t) =>
+        t.line ? (
+          <div
+            key={t.id}
+            className="a-toast pointer-events-auto relative flex items-center gap-2.5 max-w-full bg-s4/80 backdrop-blur-2xl rounded-[16px] pl-2 pr-3 py-2 elev-3 ring-1 ring-white/10"
+          >
+            <span
+              className={`grid place-items-center size-9 rounded-[12px] shrink-0 ${
+                t.line.region === "cn"
+                  ? "bg-mint/15 text-mint"
+                  : "bg-cyan/15 text-cyan"
+              }`}
+            >
+              {t.line.region === "cn" ? <IBoltF size={17} /> : <IGlobe size={17} />}
+            </span>
+            <div className="min-w-0">
+              <div className="text-[13px] font-semibold text-on leading-tight">
+                {t.line.region === "cn" ? "国内线路" : "国外线路"}
+              </div>
+              <div className="text-[11px] text-dim leading-tight mt-0.5 truncate">{t.line.host}</div>
+            </div>
+            <div className="ml-1.5 flex items-baseline gap-0.5 shrink-0 pl-2.5 border-l border-white/10">
+              <span
+                className={`text-[15px] font-bold tabular-nums ${
+                  t.line.ms <= 0
+                    ? "text-dim"
+                    : t.line.ms < 500
+                      ? "text-mint"
+                      : t.line.ms < 1000
+                        ? "text-amber"
+                        : "text-danger"
+                }`}
+              >
+                {t.line.ms > 0 ? t.line.ms : "—"}
+              </span>
+              {t.line.ms > 0 && <span className="text-[10px] font-semibold text-dim">ms</span>}
+            </div>
+          </div>
+        ) : (
+          <div key={t.id} className="a-toast pointer-events-auto flex items-center gap-2.5 max-w-full bg-s4/95 backdrop-blur-md rounded-(--r-sm) pl-3.5 pr-4 py-2.5 elev-3">
+            {t.icon === "ok" && <ICheck size={16} className="text-mint shrink-0" />}
+            {t.icon === "heart" && <IHeartF size={16} className="text-neon shrink-0" />}
+            {t.icon === "star" && <IStarF size={16} className="text-amber shrink-0" />}
+            {t.icon === "info" && <ISparkF size={15} className="text-cyan shrink-0" />}
+            <span className="text-[13px] text-on truncate">{t.msg}</span>
+          </div>
+        ),
+      )}
     </div>
   );
 }
@@ -144,37 +183,15 @@ export function CloseBtn({ onClick }: { onClick: () => void }) {
 export function Img({ src, alt = "", className = "", eager = false, raw = false }: {
   src: string; alt?: string; className?: string; eager?: boolean; raw?: boolean;
 }) {
+  const [ok, setOk] = useState(false);
+  const [err, setErr] = useState(false);
   const url = raw ? src : cover(src);
-  // A new source gets fresh loading/error state; late events cannot affect it.
-  return <ImageSource key={url} url={url} alt={alt} className={className} eager={eager} />;
-}
-
-function ImageSource({ url, alt, className, eager }: {
-  url: string; alt: string; className: string; eager: boolean;
-}) {
-  const host = useRef<HTMLDivElement>(null);
-  const [requested, setRequested] = useState(eager);
-  const [state, setState] = useState<"loading" | "loaded" | "error">("loading");
-  useEffect(() => {
-    if (eager || !("IntersectionObserver" in window)) { setRequested(true); return; }
-    if (requested || !host.current) return;
-    // Observe the stable wrapper, avoiding native lazy-image visibility in fragmented layouts.
-    const observer = new IntersectionObserver(entries => {
-      if (entries.some(entry => entry.isIntersecting)) {
-        setRequested(true);
-        observer.disconnect();
-      }
-    }, { rootMargin: "600px" });
-    observer.observe(host.current);
-    return () => observer.disconnect();
-  }, [eager, requested]);
   return (
-    <div ref={host} className={`absolute inset-0 overflow-hidden ${className}`}>
-      {state === "loading" && <div className="absolute inset-0 shimmer" />}
-      {state === "error" && <div className="absolute inset-0 bg-s3" />}
-      {requested && url && <img src={url} alt={alt} loading="eager"
-        onLoad={() => setState("loaded")} onError={() => setState("error")}
-        className={`absolute inset-0 w-full h-full object-cover ${state === "loaded" ? "opacity-100" : "opacity-0"}`} draggable={false} />}
+    <div className={`absolute inset-0 overflow-hidden ${className}`}>
+      {!ok && !err && <div className="absolute inset-0 shimmer" />}
+      {err && <div className="absolute inset-0 bg-s3" />}
+      <img src={url} alt={alt} loading={eager ? "eager" : "lazy"} onLoad={() => setOk(true)} onError={() => setErr(true)}
+        className={`absolute inset-0 w-full h-full object-cover transition-opacity duration-300 ${ok ? "opacity-100" : "opacity-0"}`} draggable={false} />
     </div>
   );
 }

@@ -3,7 +3,7 @@
 //! 站点把全部 `/api/**` 调用收敛成 `POST /api/edge/request` 的信封，
 //! 我们只实现这一个入口，其余接口都是「填 path」。
 //!
-//! # 代理（用户反馈「浏览器能开、HGhub 打不开」的根因就在这里）
+//! # 代理（用户反馈「浏览器能开、HGhubX 打不开」的根因就在这里）
 //!
 //! 客户端的流量**全部**走本文件的 reqwest，跟 WebView2 无关，所以它既不共享
 //! 浏览器的代理设置，也不共享浏览器的证书库：
@@ -17,7 +17,9 @@
 //!   安卓上只有 VPN/TUN 模式（VpnService 抓全流量）才有效。
 //!
 //! 排查手段：环境变量 `HGHUB_PROXY=http://127.0.0.1:7897` 可强制指定代理，
-//! `net_diag` 命令会输出 DNS/HTTP/环境变量快照。
+//! 进程里的 `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` 由 reqwest `system-proxy` 读取；
+//! Linux 桌面还会读 GNOME 的 `gsettings` 手动代理（http/socks），无需用户手动设置。
+//! `net_diag` 命令会输出 DNS/HTTP/环境变量与探测到的代理（脱敏）快照。
 
 use crate::network_policy;
 use base64::engine::general_purpose::STANDARD as B64;
@@ -27,6 +29,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -58,27 +61,20 @@ pub fn normalize_base(raw: &str) -> Option<String> {
     Some(parsed.origin().ascii_serialization())
 }
 
-/// 远端发布页只提供游客镜像，不能扩展账号密码的信任范围。
+/// 凭据仅发送到固定 HTTPS 业务来源，不因镜像发现或 CIDR 例外扩大信任。
 pub fn trusted_auth_origin(origin: &str) -> bool {
     matches!(origin, "https://huangguoai.com" | "https://huangguoai.ai")
 }
 
-/// 启动时读回上次选择的线路（文件不存在 / 内容坏了就保持默认）。
+/// 启动时绑定线路：唯一播放源固定为 huangguoai.com，不再恢复旧 line.json
+/// （升级前用户可能停在镜像），直接清掉旧配置，base 恒为 DEFAULT_BASE。
 pub fn bind_base(dir: &std::path::Path) {
     network_policy::bind_security(dir);
     let path = dir.join("line.json");
-    if let Ok(text) = std::fs::read_to_string(&path) {
-        if let Ok(v) = serde_json::from_str::<Value>(&text) {
-            if let Some(next) = v
-                .get("base")
-                .and_then(|x| x.as_str())
-                .and_then(normalize_base)
-            {
-                if let Ok(mut cur) = BASE.write() {
-                    *cur = next;
-                }
-            }
-        }
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {}
     }
     if let Ok(mut f) = BASE_FILE.write() {
         *f = Some(path);
@@ -120,6 +116,141 @@ fn proxy_override() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// 进程环境变量里有没有代理（reqwest 的 `system-proxy` 会自己读这些，不重复应用）。
+fn env_proxy_set() -> bool {
+    ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]
+        .iter()
+        .any(|key| std::env::var(key).ok().is_some_and(|v| !v.trim().is_empty()))
+}
+
+/// 应用层最终采用的显式代理（不含环境变量——那部分交给 reqwest）。
+/// 优先级：`HGHUB_PROXY` > 进程环境变量（reqwest 处理）> Linux GNOME gsettings。
+fn detected_proxy() -> Option<String> {
+    if let Some(p) = proxy_override() {
+        return Some(p);
+    }
+    if env_proxy_set() {
+        return None;
+    }
+    gnome_proxy()
+}
+
+#[cfg(target_os = "linux")]
+fn unquote(s: &str) -> String {
+    let s = s.trim();
+    if s.len() >= 2 && s.starts_with('\'') && s.ends_with('\'') {
+        s[1..s.len() - 1].to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// 读 GNOME 系统代理配置（gsettings）。gsettings 不存在 / schema 缺失时返回 None。
+#[cfg(target_os = "linux")]
+fn gsettings_get(schema: &str, key: &str) -> Option<String> {
+    let out = std::process::Command::new("gsettings")
+        .args(["get", schema, key])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(unquote(&String::from_utf8_lossy(&out.stdout)))
+}
+
+#[cfg(target_os = "linux")]
+fn format_proxy_url(scheme: &str, host: &str, port: &str) -> String {
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    format!("{scheme}://{host}:{port}")
+}
+
+/// Linux 桌面（GNOME）的固定手动代理：`mode=manual` 时取 http，为空再试 socks。
+/// PAC（mode=auto）不支持，返回 None。
+#[cfg(target_os = "linux")]
+fn gnome_proxy() -> Option<String> {
+    if gsettings_get("org.gnome.system.proxy", "mode").as_deref() != Some("manual") {
+        return None;
+    }
+    let http_host = gsettings_get("org.gnome.system.proxy.http", "host").unwrap_or_default();
+    let http_port = gsettings_get("org.gnome.system.proxy.http", "port").unwrap_or_default();
+    if !http_host.is_empty() && !http_port.is_empty() {
+        return Some(format_proxy_url("http", &http_host, &http_port));
+    }
+    let socks_host = gsettings_get("org.gnome.system.proxy.socks", "host").unwrap_or_default();
+    let socks_port = gsettings_get("org.gnome.system.proxy.socks", "port").unwrap_or_default();
+    if !socks_host.is_empty() && !socks_port.is_empty() {
+        return Some(format_proxy_url("socks5", &socks_host, &socks_port));
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn gnome_proxy() -> Option<String> {
+    None
+}
+
+/// Windows 系统代理：读 `HKCU\...\Internet Settings`，`ProxyEnable=1` 且 `ProxyServer`
+/// 非空即视为已启用。reqwest 已开 `system-proxy` 会自动按注册表走，这里只返回 bool。
+#[cfg(target_os = "windows")]
+fn windows_proxy_enabled() -> bool {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+    let Ok(key) = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
+    else {
+        return false;
+    };
+    let enabled: u32 = match key.get_value("ProxyEnable") {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    if enabled != 1 {
+        return false;
+    }
+    key.get_value::<String, _>("ProxyServer")
+        .is_ok_and(|server| !server.trim().is_empty())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn windows_proxy_enabled() -> bool {
+    false
+}
+
+/// macOS 系统代理：`scutil --proxy` 输出里 HTTP/HTTPS/SOCKS 任一项 Enable=1 即视为已启用。
+#[cfg(target_os = "macos")]
+fn macos_proxy_enabled() -> bool {
+    let Ok(out) = std::process::Command::new("scutil").arg("--proxy").output() else {
+        return false;
+    };
+    if !out.status.success() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    ["HTTPEnable", "HTTPSEnable", "SOCKSEnable"]
+        .iter()
+        .any(|key| {
+            text.lines().any(|line| {
+                let mut parts = line.splitn(2, ':');
+                parts.next().map(str::trim) == Some(*key)
+                    && parts.next().map(|value| value.trim() == "1").unwrap_or(false)
+            })
+        })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_proxy_enabled() -> bool {
+    false
+}
+
+/// 操作系统级系统代理是否已启用（Windows 注册表 / macOS scutil / Linux GNOME），只报 bool。
+fn system_proxy_enabled() -> bool {
+    windows_proxy_enabled() || macos_proxy_enabled() || gnome_proxy().is_some()
+}
+
 /// 按**当前**系统代理设置新建一个客户端。
 ///
 /// 注意：reqwest 的 `system-proxy` 只在构建时读一次注册表 / 环境变量。代理软件被关掉后，
@@ -138,9 +269,9 @@ fn build_client(host: &str, addrs: &[SocketAddr]) -> Result<reqwest::Client, Str
     if !addrs.is_empty() {
         builder = builder.resolve_to_addrs(host, addrs);
     }
-    if let Some(p) = proxy_override() {
+    if let Some(p) = detected_proxy() {
         // 错误信息不能含原始代理 URL（其中可能有用户名/密码）。
-        let proxy = reqwest::Proxy::all(&p).map_err(|_| "HGHUB_PROXY 配置无效（已隐藏原始值）")?;
+        let proxy = reqwest::Proxy::all(&p).map_err(|_| "代理配置无效（已隐藏原始值）")?;
         builder = builder.proxy(proxy);
     }
     builder
@@ -148,10 +279,12 @@ fn build_client(host: &str, addrs: &[SocketAddr]) -> Result<reqwest::Client, Str
         .map_err(|_| "无法创建 HTTP 客户端".to_string())
 }
 
+static CLIENT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 const CLIENT_TTL: Duration = Duration::from_secs(30);
 type ClientCache = HashMap<String, (Instant, Arc<reqwest::Client>)>;
-static CLIENT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static CLIENTS: Lazy<Mutex<ClientCache>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static MEDIA_DNS_ROUTES: Lazy<Mutex<crate::media_dns::Routes>> =
+    Lazy::new(|| Mutex::new(crate::media_dns::Routes::default()));
 
 fn cached_client(cache: &ClientCache, key: &str, now: Instant) -> Option<Arc<reqwest::Client>> {
     cache
@@ -163,24 +296,46 @@ fn cached_client(cache: &ClientCache, key: &str, now: Instant) -> Option<Arc<req
 /// 缓存按模式、主机和端口隔离；有效期内仅复用已经检查并固定地址的客户端。
 /// 到期后重新检查全部 DNS 答案，不使用旧连接绕过新的目标检查。
 async fn client_for(raw: &str) -> Result<(url::Url, Arc<reqwest::Client>), String> {
+    client_for_dns(raw, false).await
+}
+
+/// 是否处于「有代理」状态：显式代理（`HGHUB_PROXY`）、系统代理（Linux GNOME / Windows 注册表 / macOS scutil）或进程环境变量。
+/// 此状态仅隔离客户端缓存；严格模式仍检查 DNS，避免 NO_PROXY 绕过代理时漏检。
+fn proxy_active() -> bool {
+    detected_proxy().is_some()
+        || env_proxy_set()
+        || windows_proxy_enabled()
+        || macos_proxy_enabled()
+}
+
+async fn client_for_dns(raw: &str, public_dns: bool) -> Result<(url::Url, Arc<reqwest::Client>), String> {
+    let generation = CLIENT_GENERATION.load(Ordering::SeqCst);
     let strict = network_policy::strict_security();
     let target = network_policy::parse_target_with_mode(raw, strict)?;
     let host = target.host_str().ok_or("目标缺少主机名")?;
     let port = target.port_or_known_default().ok_or("目标端口无效")?;
-    let generation = CLIENT_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
-    let key = format!("{generation}:{strict}:{host}:{port}");
+    let proxy = proxy_active();
+    let key = format!("{generation}:{strict}:{host}:{port}:{public_dns}:{proxy}");
     {
         let cache = CLIENTS.lock().map_err(|_| "HTTP 客户端锁失败")?;
         if let Some(http) = cached_client(&cache, &key, Instant::now()) {
+            if CLIENT_GENERATION.load(Ordering::SeqCst) != generation { return Err("网络策略已变化，请重试".into()); }
             return Ok((target, http));
         }
     }
-    let addrs = if strict {
-        network_policy::resolve_target(&target, strict).await?
+    // Strict checks also apply when a proxy is configured: NO_PROXY may route directly.
+    let (addrs, ttl) = if public_dns {
+        let resolver = build_client(crate::media_dns::HOST, &crate::media_dns::BOOTSTRAP)?;
+        let resolution = crate::media_dns::resolve(&resolver, host, port).await?;
+        network_policy::check_addresses_with_mode(&resolution.addresses, strict)?;
+        (resolution.addresses, CLIENT_TTL.min(resolution.ttl))
+    } else if strict {
+        (network_policy::resolve_target(&target, strict).await?, CLIENT_TTL)
     } else {
-        Vec::new()
+        (Vec::new(), CLIENT_TTL)
     };
     let http = Arc::new(build_client(host, &addrs)?);
+    if CLIENT_GENERATION.load(Ordering::SeqCst) != generation { return Err("网络策略已变化，请重试".into()); }
     let now = Instant::now();
     let mut cache = CLIENTS.lock().map_err(|_| "HTTP 客户端锁失败")?;
     // 同时到达的请求可能已完成解析；不延长已有结果的有效期。
@@ -190,15 +345,18 @@ async fn client_for(raw: &str) -> Result<(url::Url, Arc<reqwest::Client>), Strin
         if cache.len() >= 64 {
             cache.clear();
         }
-        cache.insert(key, (now + CLIENT_TTL, http.clone()));
+        cache.insert(key, (now + ttl, http.clone()));
     }
     Ok((target, http))
 }
 
 pub fn refresh_client() {
-    CLIENT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    CLIENT_GENERATION.fetch_add(1, Ordering::SeqCst);
     if let Ok(mut cache) = CLIENTS.lock() {
         cache.clear();
+    }
+    if let Ok(mut routes) = MEDIA_DNS_ROUTES.lock() {
+        *routes = crate::media_dns::Routes::default();
     }
 }
 
@@ -209,14 +367,35 @@ pub async fn get(
     accept: Option<&str>,
     referer: Option<&str>,
 ) -> Result<reqwest::Response, String> {
-    get_with_range(raw, timeout, accept, referer, None).await
+    get_with_dns(raw, timeout, accept, referer, false, None).await
 }
 
 pub async fn get_with_range(
+    raw: &str, timeout: Duration, accept: Option<&str>, referer: Option<&str>, range: Option<&str>,
+) -> Result<reqwest::Response, String> {
+    let target = network_policy::parse_target(raw)?;
+    let host = target.host_str().ok_or("目标缺少主机名")?;
+    let public_dns = MEDIA_DNS_ROUTES.lock().map(|routes| routes.prefers_public(host, Instant::now())).unwrap_or(false);
+    let first = get_with_dns(raw, timeout, accept, referer, public_dns, range).await;
+    match first {
+        Err(error) if crate::media_dns::eligible(&target, &error) => {
+            let result = get_with_dns(raw, timeout, accept, referer, !public_dns, range).await;
+            if let Ok(mut routes) = MEDIA_DNS_ROUTES.lock() {
+                if result.is_ok() && !public_dns { routes.remember(host, Instant::now()); }
+                else { routes.forget(host); }
+            }
+            result
+        }
+        result => result,
+    }
+}
+
+async fn get_with_dns(
     raw: &str,
     timeout: Duration,
     accept: Option<&str>,
     referer: Option<&str>,
+    public_dns: bool,
     range: Option<&str>,
 ) -> Result<reqwest::Response, String> {
     tokio::time::timeout(timeout, async {
@@ -227,7 +406,7 @@ pub async fn get_with_range(
         let mut next = network_policy::parse_target(raw).map_err(|e| policy_error("parse", e))?;
         for hop in 0..=5 {
             let resolving = Instant::now();
-            let (target, http) = client_for(next.as_str()).await.map_err(|e| policy_error("dns_or_client", e))?;
+            let (target, http) = client_for_dns(next.as_str(), public_dns).await.map_err(|e| policy_error("dns_or_client", e))?;
             crate::playback_log::record("network.target_ready", json!({"resource": crate::playback_log::resource_id(raw), "target_resource": crate::playback_log::resource_id(target.as_str()), "dns_or_client_ms": resolving.elapsed().as_millis() as u64, "hop": hop}));
             let mut request = http.get(target.clone()).timeout(timeout);
             if let Some(value) = accept {
@@ -236,10 +415,7 @@ pub async fn get_with_range(
             if let Some(value) = referer {
                 request = request.header("Referer", value);
             }
-            if let Some(value) = range {
-                request = request.header(reqwest::header::RANGE, value)
-                    .header(reqwest::header::ACCEPT_ENCODING, "identity");
-            }
+            if let Some(value) = range { request = request.header(reqwest::header::RANGE, value).header(reqwest::header::ACCEPT_ENCODING, "identity"); }
             let response = request.send().await.map_err(|e| err_text(&e))?;
             if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
                 return Ok(response);
@@ -328,6 +504,7 @@ pub fn err_text(e: &reqwest::Error) -> String {
     out
 }
 
+#[cfg(test)]
 fn dns_summary(addrs: impl IntoIterator<Item = SocketAddr>) -> Value {
     let mut ips: Vec<_> = addrs.into_iter().map(|addr| addr.ip()).collect();
     ips.sort_unstable();
@@ -345,7 +522,220 @@ fn dns_summary(addrs: impl IntoIterator<Item = SocketAddr>) -> Value {
     json!({ "count": ips.len(), "has_fake_ip": has_fake_ip })
 }
 
-/// 网络自检：DNS / HTTP / 代理相关环境变量，用于远程定位「打不开」。
+/// IPv4 地址分类。诊断要能回答「解析到的是正常公网，还是被投毒/被接管」。
+fn ipv4_kind(o: [u8; 4]) -> &'static str {
+    let v4 = std::net::Ipv4Addr::from(o);
+    if v4.is_loopback() {
+        "loopback"
+    } else if o == [0, 0, 0, 0] {
+        "unspecified"
+    } else if o[0] == 198 && (o[1] == 18 || o[1] == 19) {
+        // Clash / Surge 系 TUN 的 fake-ip 网段：TUN 一关这个地址就不可路由。
+        "fake_ip"
+    } else if v4.is_private() {
+        "private"
+    } else if v4.is_link_local() {
+        "link_local"
+    } else if v4.is_broadcast() {
+        "broadcast"
+    } else {
+        "public"
+    }
+}
+
+fn ip_kind(ip: std::net::IpAddr) -> &'static str {
+    match ip {
+        std::net::IpAddr::V4(v4) => ipv4_kind(v4.octets()),
+        std::net::IpAddr::V6(v6) => {
+            if v6.is_loopback() {
+                "loopback"
+            } else if v6.is_unspecified() {
+                "unspecified"
+            } else if let Some(v4) = v6.to_ipv4_mapped() {
+                ipv4_kind(v4.octets())
+            } else {
+                "public"
+            }
+        }
+    }
+}
+
+/// DNS 报告：数量 / 耗时 / 地址种类 / 是否 fake-ip。
+///
+/// **只把可疑地址原样列出**（回环、内网、保留段、fake-ip），公网答案只给数量——
+/// 贴到公开 issue 里也不必泄露完整解析结果，但「被投毒到 127.0.0.1」这类
+/// 一眼就能看见。
+fn dns_report(addrs: &[SocketAddr], ms: u128) -> Value {
+    let mut ips: Vec<std::net::IpAddr> = addrs.iter().map(|a| a.ip()).collect();
+    ips.sort_unstable();
+    ips.dedup();
+    let mut kinds: Vec<&str> = ips.iter().map(|ip| ip_kind(*ip)).collect();
+    kinds.sort_unstable();
+    kinds.dedup();
+    let suspicious: Vec<String> = ips
+        .iter()
+        .filter(|ip| ip_kind(**ip) != "public")
+        .map(|ip| ip.to_string())
+        .collect();
+    json!({
+        "ms": ms as u64,
+        "count": ips.len(),
+        "has_fake_ip": kinds.contains(&"fake_ip"),
+        "kinds": kinds,
+        "suspicious": suspicious,
+    })
+}
+
+/// 拿到解析结果后直连一次，用来区分「DNS 能解析但 SYN 被黑洞」和「HTTP 层出错」。
+async fn tcp_probe(addr: Option<SocketAddr>, timeout: Duration) -> Value {
+    let Some(addr) = addr else {
+        return json!({ "skipped": true, "reason": "没有可用的解析结果" });
+    };
+    let started = Instant::now();
+    match tokio::time::timeout(timeout, tokio::net::TcpStream::connect(addr)).await {
+        Ok(Ok(_)) => json!({
+            "addr": addr.to_string(),
+            "ok": true,
+            "ms": started.elapsed().as_millis() as u64,
+        }),
+        Ok(Err(e)) => json!({
+            "addr": addr.to_string(),
+            "ok": false,
+            "ms": started.elapsed().as_millis() as u64,
+            "error": e.to_string(),
+        }),
+        Err(_) => json!({
+            "addr": addr.to_string(),
+            "ok": false,
+            "timeout": true,
+            "ms": timeout.as_millis() as u64,
+            "error": "连接超时（SYN 无响应）",
+        }),
+    }
+}
+
+/// 把三组探测结果压成一句人话结论 + 可执行的建议，issue 里一眼能看懂。
+fn verdict(dns: &Value, tcp: &Value, http: &Value) -> (&'static str, String, Vec<String>) {
+    let dns_err = dns.get("error").and_then(|v| v.as_str());
+    let fake = dns.get("has_fake_ip").and_then(|v| v.as_bool()).unwrap_or(false);
+    let kinds = dns.get("kinds").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let suspicious = dns.get("suspicious").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    let status = http.get("status").and_then(|v| v.as_u64());
+    let http_err = http.get("error").and_then(|v| v.as_str()).unwrap_or("");
+    let tcp_ok = tcp.get("ok").and_then(|v| v.as_bool());
+
+    // 系统 resolver 报错、但真实请求能通：诊断别把人带偏。
+    if dns_err.is_some() && status.is_some() {
+        return (
+            "dns_false_alarm",
+            "DNS 探测自身失败，但 HTTP 实际可以连通（系统 resolver 异常或被代理接管），不影响使用".into(),
+            vec![],
+        );
+    }
+    if let Some(e) = dns_err {
+        return (
+            "dns_fail",
+            format!("域名解析失败：{e}"),
+            vec![
+                "关掉代理 / 加速器 / VPN 的 TUN 模式后重试（最常见的元凶）".into(),
+                "换网络对比：Wi-Fi 与流量互切".into(),
+                "安卓「私有 DNS」改为自动，或填 223.5.5.5 / 1.1.1.1".into(),
+            ],
+        );
+    }
+    if fake {
+        // 代理正常工作时 HTTP 也是通的，这种情况不能报故障，否则每个开 Clash 的用户都会被吓一跳。
+        let http_ok = status.is_some_and(|c| (200..400).contains(&c));
+        if http_ok {
+            return (
+                "ok_proxy",
+                "DNS 被代理/TUN 接管（fake-ip），但连接正常，可继续使用".into(),
+                vec!["若要排查网络问题，请先退出代理再诊断一次".into()],
+            );
+        }
+        return (
+            "fake_ip",
+            format!(
+                "解析到 fake-ip（{}），DNS 流量被代理/TUN 接管；代理一断开这个地址不可路由",
+                suspicious
+                    .first()
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("198.18.x.x")
+            ),
+            vec![
+                "关掉 Clash / Surge 等代理的 TUN（增强）模式，或直接退出代理".into(),
+                "若必须用代理，请保证代理常驻且节点稳定后再开 App".into(),
+            ],
+        );
+    }
+    if kinds
+        .iter()
+        .any(|k| matches!(k.as_str(), Some("loopback" | "unspecified" | "private")))
+    {
+        return (
+            "dns_hijack",
+            "解析结果落在回环 / 内网 / 保留地址，DNS 被劫持或线路被污染".into(),
+            vec![
+                "换一个 DNS（223.5.5.5、1.1.1.1）后重启 App".into(),
+                "关闭省电模式或系统的「网络加速」类功能".into(),
+            ],
+        );
+    }
+    if tcp_ok == Some(false) {
+        let timeout = tcp.get("timeout").and_then(|v| v.as_bool()).unwrap_or(false);
+        return (
+            if timeout { "tcp_timeout" } else { "tcp_refused" },
+            if timeout {
+                "DNS 正常，但 TCP 连接无响应（SYN 被丢弃）：运营商或防火墙阻断".to_string()
+            } else {
+                format!(
+                    "DNS 正常，但 TCP 连接被拒绝：{}",
+                    tcp.get("error").and_then(|v| v.as_str()).unwrap_or("未知原因")
+                )
+            },
+            vec![
+                "换网络（尤其换运营商 / 关掉网络加速器）后重试".into(),
+                "确认没有防火墙或家长控制拦截该域名".into(),
+            ],
+        );
+    }
+    if !http_err.is_empty() {
+        let lower = http_err.to_lowercase();
+        let tls = lower.contains("certificate")
+            || lower.contains("tls")
+            || lower.contains("ssl")
+            || lower.contains("handshake");
+        return (
+            if tls { "tls_intercept" } else { "http_fail" },
+            if tls {
+                "TLS 握手/证书校验失败：多半是代理做了中间人，或系统时间不对".to_string()
+            } else {
+                format!("HTTP 请求失败：{http_err}")
+            },
+            vec![
+                "关闭代理的「HTTPS 解密 / 中间人」功能".into(),
+                "检查系统时间是否准确".into(),
+            ],
+        );
+    }
+    match status {
+        Some(code) if (200..400).contains(&code) => (
+            "ok",
+            format!("连通正常（HTTP {code}），线路可用"),
+            vec![],
+        ),
+        Some(code) => (
+            "http_status",
+            format!("域名与网络都通，但服务端返回 HTTP {code}"),
+            vec!["稍后重试，或换一条线路".into()],
+        ),
+        None => ("unknown", "诊断信息不足".into(), vec![]),
+    }
+}
+
+/// 网络自检：DNS / TCP / HTTP / 代理环境变量，用于远程定位「打不开」。
+///
+/// 结论直接给在 `verdict` / `summary` / `advice` 里，用户复制出去就能看懂。
 pub async fn diagnose() -> Value {
     let cur = base();
     let host = url::Url::parse(&cur)
@@ -353,19 +743,40 @@ pub async fn diagnose() -> Value {
         .and_then(|u| u.host_str().map(|h| h.to_string()))
         .unwrap_or_default();
 
-    // fake-ip（198.18.0.0/15）说明 DNS 被 TUN 接管：关掉 TUN 后这个地址根本不可路由。
-    let dns = {
-        let host = host.clone();
-        tokio::task::spawn_blocking(move || {
-            use std::net::ToSocketAddrs;
-            match (host.as_str(), 443u16).to_socket_addrs() {
-                Ok(iter) => dns_summary(iter),
-                Err(_) => json!({ "error": "DNS 解析失败" }),
-            }
-        })
+    // DNS：必须和真实请求走同一条解析路径（tokio lookup_host），
+    // 否则会出现「诊断报解析失败、实际却打得开」的假阴性。
+    let dns_started = Instant::now();
+    let mut first_addr: Option<SocketAddr> = None;
+    let dns = if host.is_empty() {
+        json!({ "error": "当前线路没有主机名" })
+    } else {
+        match tokio::time::timeout(
+            Duration::from_secs(6),
+            tokio::net::lookup_host((host.as_str(), 443u16)),
+        )
         .await
-        .unwrap_or(Value::Null)
+        {
+            Ok(Ok(iter)) => {
+                let addrs: Vec<SocketAddr> = iter.collect();
+                let ms = dns_started.elapsed().as_millis();
+                first_addr = addrs.first().copied();
+                dns_report(&addrs, ms)
+            }
+            Ok(Err(e)) => json!({
+                "error": "DNS 解析失败",
+                "detail": e.to_string(),
+                "ms": dns_started.elapsed().as_millis() as u64,
+            }),
+            Err(_) => json!({
+                "error": "DNS 解析超时",
+                "timeout": true,
+                "ms": 6000,
+            }),
+        }
     };
+
+    // TCP：拿到地址就直连一次，把「DNS 通但连不上」和「HTTP 层出错」分开。
+    let tcp = tcp_probe(first_addr, Duration::from_secs(5)).await;
 
     let started = Instant::now();
     let http = match get(&format!("{cur}/"), Duration::from_secs(20), None, None).await {
@@ -374,15 +785,22 @@ pub async fn diagnose() -> Value {
             "ms": started.elapsed().as_millis() as u64,
         }),
         Err(e) => json!({
+            "kind": crate::playback_log::error_kind(&e),
             "error": e,
             "ms": started.elapsed().as_millis() as u64,
         }),
     };
 
+    let (code, summary, advice) = verdict(&dns, &tcp, &http);
+
     json!({
+        "verdict": code,
+        "summary": summary,
+        "advice": advice,
         "base": cur,
         "host": host,
         "dns": dns,
+        "tcp": tcp,
         "http": http,
         "env": {
             "HTTP_PROXY": std::env::var("HTTP_PROXY").ok().map(|p| redact_proxy(&p)),
@@ -390,6 +808,13 @@ pub async fn diagnose() -> Value {
             "ALL_PROXY": std::env::var("ALL_PROXY").ok().map(|p| redact_proxy(&p)),
             "NO_PROXY": std::env::var("NO_PROXY").ok().map(|_| "[已配置，列表已隐藏]"),
             "HGHUB_PROXY": proxy_override().map(|p| redact_proxy(&p)),
+            "GNOME_PROXY": gnome_proxy().map(|p| redact_proxy(&p)),
+            "system_proxy": system_proxy_enabled(),
+        },
+        "runtime": {
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+            "ver": env!("CARGO_PKG_VERSION"),
         },
     })
 }
@@ -447,7 +872,7 @@ fn edge_operation(path: &str) -> &'static str {
     let path = path.split('?').next().unwrap_or("");
     if path.starts_with("/api/videos/category/") {
         "category"
-    } else if path.starts_with("/api/videos/") && (path.ends_with("/play") || path.ends_with("/playback")) {
+    } else if path.starts_with("/api/videos/") && path.ends_with("/play") {
         "play"
     } else if path == "/api/videos" {
         "feed"
@@ -528,9 +953,7 @@ pub async fn edge(
     let operation = edge_operation(path);
     let mut attempt = 0;
     let guest_get = method.eq_ignore_ascii_case("GET") && body.is_none() && token.is_none();
-    // 取播放地址的 POST 没有副作用，和 GET 一样允许重试
-    let can_retry = (method.eq_ignore_ascii_case("GET") && body.is_none())
-        || (method.eq_ignore_ascii_case("POST") && operation == "play");
+    let can_retry = method.eq_ignore_ascii_case("GET") && body.is_none();
     let value = with_retry(can_retry, || {
         attempt += 1;
         let attempt = attempt;
@@ -637,6 +1060,10 @@ pub async fn fetch_bytes(url: &str) -> Result<(Option<String>, Vec<u8>), String>
     let resource = crate::playback_log::resource_id(url);
     let mut attempt = 0;
     let url = url.to_string();
+    let target = url::Url::parse(&url).ok();
+    let host = target.as_ref().and_then(|target| target.host_str()).unwrap_or("").to_string();
+    let public_dns = AtomicBool::new(MEDIA_DNS_ROUTES.lock().ok()
+        .is_some_and(|routes| routes.prefers_public(&host, Instant::now())));
     let referer = format!("{}/", base());
     with_retry(true, || {
         attempt += 1;
@@ -644,13 +1071,17 @@ pub async fn fetch_bytes(url: &str) -> Result<(Option<String>, Vec<u8>), String>
         let resource = resource.clone();
         let url = url.clone();
         let referer = referer.clone();
+        let host = &host;
+        let target = &target;
+        let public_dns = &public_dns;
         async move {
+            let using_public_dns = public_dns.load(Ordering::Relaxed);
             let started = Instant::now();
             crate::playback_log::record("network.begin", json!({"request": request, "resource": resource, "attempt": attempt}));
             let mut status = None;
             let mut headers_ms = None;
             let result = async {
-                let resp = get(&url, Duration::from_secs(20), None, Some(&referer)).await?;
+                let resp = get_with_dns(&url, Duration::from_secs(20), None, Some(&referer), using_public_dns, None).await?;
                 status = Some(resp.status().as_u16());
                 headers_ms = Some(started.elapsed().as_millis() as u64);
                 if !resp.status().is_success() {
@@ -664,7 +1095,22 @@ pub async fn fetch_bytes(url: &str) -> Result<(Option<String>, Vec<u8>), String>
                 let bytes = resp.bytes().await.map_err(|e| err_text(&e))?.to_vec();
                 Ok((ctype, bytes))
             }.await;
-            crate::playback_log::record("network.end", json!({"request": request, "resource": resource, "attempt": attempt, "status": status, "headers_ms": headers_ms, "elapsed_ms": started.elapsed().as_millis() as u64, "bytes": result.as_ref().ok().map(|(_, bytes)| bytes.len()), "error_kind": result.as_ref().err().map(|e: &String| crate::playback_log::error_kind(e))}));
+            if using_public_dns {
+                if let Ok(mut routes) = MEDIA_DNS_ROUTES.lock() {
+                    if result.is_ok() {
+                        routes.remember(host, Instant::now());
+                    } else {
+                        routes.forget(host);
+                    }
+                }
+            }
+            if let Err(error) = &result {
+                if target.as_ref().is_some_and(|target| crate::media_dns::eligible(target, error)) {
+                    public_dns.store(!using_public_dns, Ordering::Relaxed);
+                    crate::playback_log::record("network.dns_fallback", json!({"resource": resource, "attempt": attempt, "public_dns": !using_public_dns, "error_kind": crate::playback_log::error_kind(error)}));
+                }
+            }
+            crate::playback_log::record("network.end", json!({"request": request, "resource": resource, "attempt": attempt, "public_dns": using_public_dns, "status": status, "headers_ms": headers_ms, "elapsed_ms": started.elapsed().as_millis() as u64, "bytes": result.as_ref().ok().map(|(_, bytes)| bytes.len()), "error_kind": result.as_ref().err().map(|e: &String| crate::playback_log::error_kind(e))}));
             result
         }
     })
@@ -674,6 +1120,38 @@ pub async fn fetch_bytes(url: &str) -> Result<(Option<String>, Vec<u8>), String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "联网测试：需要 HGHUB_TEST_MEDIA_URL 为当前有效的媒体地址"]
+    async fn media_recovers_from_failed_system_dns() {
+        let raw = std::env::var("HGHUB_TEST_MEDIA_URL").expect("HGHUB_TEST_MEDIA_URL");
+        let target = url::Url::parse(&raw).unwrap();
+        let host = target.host_str().unwrap();
+        let port = target.port_or_known_default().unwrap();
+        let failed_client = reqwest::Client::builder()
+            .no_proxy()
+            .resolve_to_addrs(host, &["127.0.0.1:9".parse().unwrap()])
+            .connect_timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        refresh_client();
+        CLIENTS.lock().unwrap().insert(
+            format!("{}:{host}:{port}:false", network_policy::strict_security()),
+            (Instant::now() + CLIENT_TTL, Arc::new(failed_client)),
+        );
+        let (_, bytes) = fetch_bytes(&raw).await.expect("备用 DNS 应恢复真实媒体下载");
+        assert!(!bytes.is_empty());
+        assert!(MEDIA_DNS_ROUTES.lock().unwrap().prefers_public(host, Instant::now()));
+        let (_, again) = fetch_bytes(&raw).await.expect("后续请求应复用恢复的路径");
+        if bytes.starts_with(b"#EXTM3U") {
+            assert!(again.starts_with(b"#EXTM3U"));
+        } else {
+            assert_eq!(bytes, again);
+        }
+        if let Ok(path) = std::env::var("HGHUB_TEST_MEDIA_OUTPUT") {
+            std::fs::write(path, bytes).unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn terminal_errors_do_not_retry_but_transient_failures_can_recover() {
@@ -719,7 +1197,6 @@ mod tests {
             ("/api/videos?page=1&size=10", "feed"),
             ("/api/videos/category/private?x=secret", "category"),
             ("/api/videos/42/play?ep=1", "play"),
-            ("/api/videos/42/episodes/1/playback", "play"),
             ("/api/search?q=private-search", "search"),
             ("/api/account/loginByPassword", "account"),
             ("/unknown/private", "other"),

@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState, type RefObject }
 import type { VideoHandle } from "./components/VideoSurface";
 import { useStore } from "./store";
 
-type Playback = { id: number; ep: number; time: number; version: number };
+type Playback = { id: number; ep: number; time: number; version: number; sourceKey?: string };
 type Session = {
   playback: Playback;
   video?: HTMLVideoElement;
@@ -16,8 +16,8 @@ type Session = {
 };
 
 /** A playback instance owns its callbacks and writer, including during source cleanup. */
-export function useWatchProgress({ id, active, videoRef, startEp, startTime }: {
-  id: number; active: boolean; videoRef: RefObject<VideoHandle | null>; startEp?: number; startTime?: number;
+export function useWatchProgress({ id, active, videoRef, startEp, startTime, sourceKey }: {
+  id: number; active: boolean; videoRef: RefObject<VideoHandle | null>; startEp?: number; startTime?: number; sourceKey?: string;
 }) {
   const { getWatchProgress, claimWatchProgress, addHistory } = useStore();
   const resolve = (id: number, ep?: number, time?: number): Omit<Playback, "version"> => {
@@ -26,9 +26,16 @@ export function useWatchProgress({ id, active, videoRef, startEp, startTime }: {
     const position = time ?? (saved?.ep === episode ? saved.t : 0);
     return { id, ep: episode, time: Number.isFinite(position) && position > 0 ? position : 0 };
   };
-  const [playback, setPlayback] = useState<Playback>(() => ({ ...resolve(id, startEp, startTime), version: 0 }));
+  const [playback, setPlayback] = useState<Playback>(() => ({ ...resolve(id, startEp, startTime), sourceKey, version: 0 }));
   // Resolve before committing the new video so no request for episode 1 can overwrite its progress.
-  if (playback.id !== id) setPlayback({ ...resolve(id), version: playback.version + 1 });
+  if (playback.id !== id) setPlayback({ ...resolve(id), sourceKey, version: playback.version + 1 });
+  else if (playback.sourceKey !== sourceKey) {
+    // Quality switches use a new video instance but retain the exact episode/position.
+    const video = videoRef.current?.el();
+    const time = video && video.readyState >= 2 && Number.isFinite(video.currentTime)
+      ? video.currentTime : getWatchProgress(id)?.t ?? playback.time;
+    setPlayback({ ...playback, time, sourceKey, version: playback.version + 1 });
+  }
   const session = useMemo<Session>(() => ({
     playback, resume: playback.time > 0 ? playback.time : null, assigned: false,
     time: 0, duration: 0, savedAt: 0, ended: false,
@@ -84,7 +91,7 @@ export function useWatchProgress({ id, active, videoRef, startEp, startTime }: {
     selectEpisode: (ep: number) => {
       if (!Number.isSafeInteger(ep) || ep < 1) return;
       save(session);
-      setPlayback(previous => ({ id, ep, time: 0, version: previous.version + 1 }));
+      setPlayback(previous => ({ id, ep, time: 0, sourceKey, version: previous.version + 1 }));
     },
     onDuration: (duration: number) => {
       if (current.current !== session || !Number.isFinite(duration) || duration <= 0) return;

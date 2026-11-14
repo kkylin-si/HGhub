@@ -57,7 +57,6 @@ export type PlayInfo = {
   title: string;
   video_url: string;
   video_url_hevc?: string;
-  /** 新版播放接口的字段；Rust 侧会把 main/hevc 回填到 video_url / video_url_hevc */
   streams?: { main?: string; hevc?: string; preview?: string };
 };
 
@@ -116,6 +115,57 @@ export type Post = {
   counts?: { like: number; comment: number; collect: number; share?: number; hot?: number };
   created_at?: string;
   publish_time?: string;
+};
+
+export type TopicCard = {
+  id: number;
+  title: string;
+  slug: string;
+  cover: string;
+  intro?: string;
+  video_count?: number;
+};
+
+export type TopicDetail = {
+  topic: TopicCard;
+  videos: Paged<VideoCard>;
+  related?: TopicCard[];
+};
+
+export type TagItem = {
+  id: number;
+  name: string;
+  slug: string;
+  cate_id?: number;
+  cate_name?: string;
+  hot_score?: number;
+  is_hot?: boolean;
+  sort?: number;
+  trend?: number;
+};
+
+export type TagGroup = {
+  code?: string;
+  id?: number;
+  name: string;
+  sort?: number;
+  tags: TagItem[];
+};
+
+export type HotWord = { heat: number; word: string };
+
+export type PostCategory = { id: number; name: string; route: string; intro?: string; sort?: number };
+
+export type UserProfile = {
+  id: number;
+  username: string;
+  nickname: string;
+  avatar: string;
+  avatar_color?: string;
+  sign?: string;
+  desc?: string;
+  user_type?: string;
+  counts?: Record<string, number>;
 };
 
 export type User = {

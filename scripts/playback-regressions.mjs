@@ -12,6 +12,19 @@ async function until(check, message, timeout = 15000) {
 }
 
 export const checks = {
+  async quality(page, h) {
+    await h.loadResumeFixture(page, '&hevc=1');
+    await h.openCategoryVideo(page); await h.expectPlayback(page, 3, 35);
+    await h.clickProgress(page, .6); await h.expectPlayback(page, 3, 54);
+    for (const expected of ['true', 'false']) {
+      await page.mouse.move(450, 100);
+      await page.locator('section:has(video)').getByRole('button', { name: '画质切换', exact: true }).click();
+      await h.expectPlayback(page, 3, 54);
+      assert.equal(await page.locator('section:has(video)').getByRole('button', { name: '画质切换', exact: true }).getAttribute('aria-pressed'), expected);
+    }
+    await h.backFromPlayer(page); await h.openCategoryVideo(page); await h.expectPlayback(page, 3, 54);
+    return { quality_switches_keep_episode_and_position: true, reopen_resumes_latest_position: true };
+  },
   async replay(page, h) {
     await h.loadResumeFixture(page);
     await page.evaluate(() => window.playerSeekFixture.record(991, 8, 85, 90));
@@ -85,9 +98,9 @@ export const checks = {
     });
     try {
       await h.pickEpisode(page, 4);
-      await page.waitForFunction(() => window.playerSeekFixture.playRequests.at(-1)?.ep === 4);
+      await page.waitForFunction(() => new URL(new URL(window.playerSeekFixture.engineState().source).searchParams.get('u')).searchParams.get('episode') === '4');
       await h.pickEpisode(page, 5);
-      await page.waitForFunction(() => window.playerSeekFixture.playRequests.at(-1)?.ep === 5);
+      await page.waitForFunction(() => new URL(new URL(window.playerSeekFixture.engineState().source).searchParams.get('u')).searchParams.get('episode') === '5');
       await h.pickEpisode(page, 6);
       await h.expectPlayback(page, 6, 0);
       unblock(); await page.waitForTimeout(250);
@@ -110,7 +123,7 @@ export const checks = {
     });
     try {
       await h.clickProgress(page, .999);
-      await page.waitForFunction(() => window.playerSeekFixture.playRequests.at(-1)?.ep === 2);
+      await page.waitForFunction(() => new URL(new URL(window.playerSeekFixture.engineState().source).searchParams.get('u')).searchParams.get('episode') === '2');
       const old = await page.evaluate(() => window.playerSeekFixture.getProgress(991));
       assert.equal(old.ep, 1); assert.equal(old.t, old.dur);
       release(); await h.expectPlayback(page, 2, 0);

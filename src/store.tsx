@@ -1,5 +1,4 @@
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import { api, platform as envPlatform } from "./api";
 import { isStrictSecurity, setStrictSecurity as setHtmlStrictSecurity } from "./html";
 import type { User } from "./types";
@@ -28,7 +27,13 @@ export type Page =
   | { kind: "ranks"; key: string }
   | { kind: "settings"; key: string }
   | { kind: "posts"; key: string }
-  | { kind: "post"; key: string; id: number };
+  | { kind: "post"; key: string; id: number }
+  | { kind: "topics"; key: string }
+  | { kind: "topic"; key: string; slug: string; name: string }
+  | { kind: "tags"; key: string }
+  | { kind: "tag"; key: string; tag: string; name: string }
+  | { kind: "following"; key: string }
+  | { kind: "user"; key: string; id: number; name?: string };
 
 export type PageInput =
   | { kind: "feed"; videoIds: number[]; index: number; title: string; source?: string; feedKind?: "video" | "post"; startEp?: number; startTime?: number }
@@ -36,9 +41,21 @@ export type PageInput =
   | { kind: "ranks" }
   | { kind: "settings" }
   | { kind: "posts" }
-  | { kind: "post"; id: number };
+  | { kind: "post"; id: number }
+  | { kind: "topics" }
+  | { kind: "topic"; slug: string; name: string }
+  | { kind: "tags" }
+  | { kind: "tag"; tag: string; name: string }
+  | { kind: "following" }
+  | { kind: "user"; id: number; name?: string };
 
-export type Toast = { id: number; msg: string; icon?: "ok" | "heart" | "star" | "info" };
+export type Toast = {
+  id: number;
+  msg: string;
+  icon?: "ok" | "heart" | "star" | "info";
+  /** 线路切换专用的结构化内容，有这个就不看 msg */
+  line?: { region: "cn" | "intl"; host: string; ms: number };
+};
 
 /** 观看记录：看到第几集、第几秒（`dur` 用来判断是否已看完） */
 export type WatchProgress = { id: number; ep: number; t: number; dur: number; at: number };
@@ -48,18 +65,22 @@ type Persist = {
   favs: number[];
   history: WatchProgress[];
   progress: Record<number, WatchProgress>;
+  subtitlesEnabled: boolean;
   follows: number[];
   muted: boolean;
   muteOnStartup: boolean;
-  subtitlesEnabled: boolean;
   volume: number;
   searchHist: string[];
+  /** 上下划切集：多集短剧上下滑就换集，而不是换下一部 */
+  swipeEp: boolean;
+  /** 优先高清：有 HEVC 就用 HEVC，播不了自动回退标准 */
+  preferHevc: boolean;
 };
 
 const LS = "hghub_app_v1";
 const DEFAULTS: Persist = {
-  likes: [], favs: [], history: [], progress: {}, follows: [],
-  muted: true, muteOnStartup: true, subtitlesEnabled: true, volume: 0.7, searchHist: [],
+  likes: [], favs: [], history: [], progress: {}, subtitlesEnabled: true, follows: [],
+  muted: true, muteOnStartup: true, volume: 0.7, searchHist: [], swipeEp: true, preferHevc: false,
 };
 
 /** 旧版本 history 是 number[]，读出来时升级成带进度的结构 */
@@ -96,9 +117,19 @@ function loadPersist(): Persist {
     for (const entry of saved) {
       if (!progress[entry.id] || progress[entry.id].at < entry.at) progress[entry.id] = entry;
     }
+
     // 只在启动时应用；本次使用中取消静音不会关闭此偏好。
     const muteOnStartup = p.muteOnStartup !== false;
-    return { ...p, subtitlesEnabled: p.subtitlesEnabled !== false, muteOnStartup, muted: muteOnStartup || p.muted === true, history: history.slice(0, 80), progress };
+    /* 1.2.9 起上下划默认就是切集。老配置里 swipeEp 存的 false 是当年的默认值，
+       不是用户主动关的，所以这里做一次性迁移；用户之后自己关掉不会再被改回来。 */
+    let swipeEp = p.swipeEp !== false;
+    try {
+      if (localStorage.getItem("hghub_swipe_ep_v2") !== "1") {
+        swipeEp = true;
+        localStorage.setItem("hghub_swipe_ep_v2", "1");
+      }
+    } catch { /* ignore */ }
+    return { ...p, swipeEp, subtitlesEnabled: p.subtitlesEnabled !== false, muteOnStartup, muted: muteOnStartup || p.muted === true, history: history.slice(0, 80), progress };
   } catch {
     return DEFAULTS;
   }
@@ -137,15 +168,19 @@ type Store = {
   toggleFollowLocal: (uid: number) => boolean;
   theater: boolean; setTheater: (v: boolean | ((p: boolean) => boolean)) => void;
   fs: boolean; setFs: (v: boolean | ((p: boolean) => boolean)) => void;
-  /** 清屏模式（单击屏幕消除所有控件，只保留纯视频内容） */
+  /** 移动端「净屏」：只留画面，UI 全隐 */
   clean: boolean; setClean: (v: boolean | ((p: boolean) => boolean)) => void;
   muted: boolean; setMuted: (v: boolean | ((p: boolean) => boolean)) => void;
   muteOnStartup: boolean; setMuteOnStartup: (on: boolean) => void;
   subtitlesEnabled: boolean; setSubtitlesEnabled: (on: boolean) => void;
+  swipeEp: boolean; setSwipeEp: (on: boolean) => void;
+  preferHevc: boolean; setPreferHevc: (on: boolean) => void;
   volume: number; setVolume: (v: number) => void;
   searchHist: string[]; addSearch: (q: string) => void; clearSearchHist: () => void;
   strictSecurity: boolean; strictSecurityReady: boolean; securityPending: boolean; cliRelaxed: boolean; setStrictSecurity: (on: boolean) => Promise<void>;
   toasts: Toast[]; toast: (msg: string, icon?: Toast["icon"]) => void;
+  /** 线路切换计数：变了就让列表页重挂载，重新拉一遍数据 */
+  lineEpoch: number;
 };
 
 const Ctx = createContext<Store>(null as unknown as Store);
@@ -158,12 +193,14 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   const writers = useRef(new Map<number, number>());
   const writerSeq = useRef(0);
   const storageFailed = useRef(false);
+
   const [theme, setThemeState] = useState<Theme>(readTheme);
   const [tab, setTabRaw] = useState<Tab>("home");
   const [stack, setStack] = useState<Page[]>([]);
   const [user, setUser] = useState<User | null>(null);
   const [loginOpen, setLoginOpen] = useState(false);
   const [toasts, setToasts] = useState<Toast[]>([]);
+  const [lineEpoch, setLineEpoch] = useState(0);
   const [theater, setTheaterState] = useState(false);
   const [fs, setFsState] = useState(false);
   const [clean, setCleanState] = useState(false);
@@ -177,6 +214,8 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     applyTheme(theme);
     try { localStorage.setItem("hghub_theme", theme); } catch { /* ignore */ }
   }, [theme]);
+
+
 
   useEffect(() => {
     api.boot()
@@ -209,6 +248,47 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     setToasts((t) => [...t.slice(-2), { id, msg, icon }]);
     window.setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 2200);
   }, []);
+  /** 自动选线切换成功后由 `autoLine.ts` 派发，这里只负责显示 */
+  useEffect(() => {
+    const onLine = (e: Event) => {
+      const d = (e as CustomEvent<{ region: "cn" | "intl"; host: string; ms: number }>).detail;
+      if (!d) return;
+      const id = ++toastSeq.current;
+      setToasts((t) => [...t.slice(-2), { id, msg: "", line: d }]);
+      window.setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 3200);
+    };
+    window.addEventListener("hg:line", onLine);
+    return () => window.removeEventListener("hg:line", onLine);
+  }, []);
+  /** 自动选线：主站和发布页上的镜像全都不通。
+   *
+   * 只说一次（60s 节流）——巡检本身 10s 一轮，不节流会一直弹。
+   * 以前这种情况会悄悄切到 `.ai`（接口全 404），用户只看到「加载失败」，
+   * 根本不知道是网络的事。
+   */
+  useEffect(() => {
+    let last = 0;
+    const onDown = () => {
+      const now = Date.now();
+      if (now - last < 60_000) return;
+      last = now;
+      const id = ++toastSeq.current;
+      setToasts((t) => [...t.slice(-2), { id, msg: "线路全部不可用，请检查网络或代理", icon: "info" }]);
+      window.setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), 3600);
+    };
+    window.addEventListener("hg:line-down", onDown);
+    return () => window.removeEventListener("hg:line-down", onDown);
+  }, []);
+  /** 线路真的换了（自动、手切都算）：
+   *
+   * 旧数据全是在上一个域名上拉的，留着等于对着一条死链路。但各列表页只在
+   * 挂载时拉一次，所以这里给一个递增的 key，让它们重挂载、重新请求。
+   */
+  useEffect(() => {
+    const bump = () => setLineEpoch((n) => n + 1);
+    window.addEventListener("hg:line-changed", bump);
+    return () => window.removeEventListener("hg:line-changed", bump);
+  }, []);
 
   const setP = useCallback((update: (previous: Persist) => Persist) => {
     const next = update(persistRef.current);
@@ -224,15 +304,11 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     setPersist(next);
   }, [toast]);
 
-  const setTab = useCallback((t: Tab) => { setTabRaw(t); setStack([]); setCleanState(false); }, []);
+  const setTab = useCallback((t: Tab) => { setTabRaw(t); setStack([]); }, []);
   const push = useCallback((pg: PageInput) => {
-    setCleanState(false);
     setStack((s) => [...s, { ...pg, key: `p${++seq}` } as Page]);
   }, []);
-  const pop = useCallback(() => {
-    setCleanState(false);
-    setStack((s) => s.slice(0, -1));
-  }, []);
+  const pop = useCallback(() => setStack((s) => s.slice(0, -1)), []);
 
   const toggleLikeLocal = useCallback((id: number) => {
     let on = false;
@@ -301,14 +377,9 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const setFs = useCallback((v: boolean | ((prev: boolean) => boolean)) => {
-    setFsState((prev) => {
-      const next = typeof v === "function" ? (v as (p: boolean) => boolean)(prev) : v;
-      if (!next) {
-        invoke("set_orientation", { landscape: false }).catch(() => {});
-        try { screen.orientation?.unlock?.(); } catch { /* ignore */ }
-      }
-      return next;
-    });
+    setFsState((prev) => (typeof v === "function" ? (v as (p: boolean) => boolean)(prev) : v));
+    // 进出全屏/净屏时把「净屏」收掉，避免退出后 UI 还藏着
+    setCleanState(false);
   }, []);
 
   const setClean = useCallback((v: boolean | ((prev: boolean) => boolean)) => {
@@ -320,6 +391,12 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
   }, []);
   const setMuteOnStartup = useCallback((on: boolean) => {
     setP((s) => ({ ...s, muteOnStartup: on }));
+  }, []);
+  const setSwipeEp = useCallback((on: boolean) => {
+    setP((s) => ({ ...s, swipeEp: on }));
+  }, []);
+  const setPreferHevc = useCallback((on: boolean) => {
+    setP((s) => ({ ...s, preferHevc: on }));
   }, []);
   const setSubtitlesEnabled = useCallback((on: boolean) => {
     setP((s) => ({ ...s, subtitlesEnabled: on }));
@@ -338,17 +415,18 @@ export function AppProvider({ children }: { children: React.ReactNode }) {
     isLiked: (id) => p.likes.includes(id),
     isFav: (id) => p.favs.includes(id),
     toggleLikeLocal, toggleFavLocal, toggleFollowLocal, getWatchProgress, claimWatchProgress, addHistory, clearHistory,
-    muted: p.muted, setMuted, volume: p.volume, setVolume,
-    theater, setTheater, fs, setFs, clean, setClean,
+    muted: p.muted, setMuted, volume: p.volume, setVolume, theater, setTheater, fs, setFs, clean, setClean,
     muteOnStartup: p.muteOnStartup, setMuteOnStartup,
     subtitlesEnabled: p.subtitlesEnabled, setSubtitlesEnabled,
+    swipeEp: p.swipeEp, setSwipeEp,
+    preferHevc: p.preferHevc, setPreferHevc,
     searchHist: p.searchHist, addSearch, clearSearchHist,
     strictSecurity, strictSecurityReady, securityPending, cliRelaxed, setStrictSecurity,
-    toasts, toast,
+    toasts, toast, lineEpoch,
   }), [theme, tab, setTab, stack, push, pop, user, loginOpen, logout,
     p, toggleLikeLocal, toggleFavLocal, toggleFollowLocal, getWatchProgress, claimWatchProgress, addHistory, clearHistory,
-    setMuted, setMuteOnStartup, setSubtitlesEnabled, setVolume, addSearch, clearSearchHist, strictSecurity, strictSecurityReady, securityPending, cliRelaxed, setStrictSecurity,
-    toasts, toast, theater, setTheater, fs, setFs, clean, setClean]);
+    setMuted, setMuteOnStartup, setSubtitlesEnabled, setSwipeEp, setPreferHevc, setVolume, addSearch, clearSearchHist, strictSecurity, strictSecurityReady, securityPending, cliRelaxed, setStrictSecurity,
+    toasts, toast, lineEpoch, theater, setTheater, fs, setFs, clean, setClean]);
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

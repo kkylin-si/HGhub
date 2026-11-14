@@ -12,6 +12,7 @@ const S = (d: React.ReactNode, fill = false) =>
     );
   };
 
+export const IVertSwap = S(<><path d="M7 8 12 4l5 4" /><path d="M7 16l5 4 5-4" /><path d="M12 8v8" /></>);
 export const IHome = S(<><path d="M3 10.5 12 3l9 7.5" /><path d="M5 9.5V21h5v-6h4v6h5V9.5" /></>);
 export const IHomeF = S(<path d="M12 2.6 2.8 10.2a1 1 0 0 0 .64 1.77H4v8.2A1.8 1.8 0 0 0 5.8 22H9.4v-5.6a2.6 2.6 0 0 1 5.2 0V22h3.6a1.8 1.8 0 0 0 1.8-1.8V12h.56a1 1 0 0 0 .64-1.77Z" />, true);
 export const ISearch = S(<><circle cx="11" cy="11" r="7" /><path d="m20.4 20.4-3.2-3.2" /></>);
@@ -97,11 +98,21 @@ export const CAT_ICONS: Record<string, ReturnType<typeof S>> = {
 
 export function Logo({ size = 28, className = "" }: { size?: number; className?: string }) {
   return (
-    <svg width={size} height={size} viewBox="0 0 48 48" className={className} aria-hidden>
-      <rect x="2" y="2" width="44" height="44" rx="12" fill="var(--p-primary)" />
-      <path d="M14 13v22M14 24h10M24 13v22" stroke="var(--p-on-primary)" strokeWidth="4.4" strokeLinecap="round" fill="none" />
-      <path d="M31 17.5c3.2 0 5.5 2.6 5.5 6.5S34.2 30.5 31 30.5" stroke="var(--p-on-primary)" strokeWidth="4" strokeLinecap="round" fill="none" />
-      <path d="m33.5 9.5 5.5 3.2-5.5 3.2Z" fill="var(--p-on-primary)" />
+    <svg width={size} height={size} viewBox="0 0 64 64" className={className} aria-hidden>
+      <defs>
+        <linearGradient id="logo-x-night" x1="4" y1="0" x2="60" y2="64" gradientUnits="userSpaceOnUse">
+          <stop stopColor="#06465b" />
+          <stop offset="1" stopColor="#002837" />
+        </linearGradient>
+      </defs>
+      <rect width="64" height="64" rx="17.455" fill="url(#logo-x-night)" />
+      <rect x=".65" y=".65" width="62.7" height="62.7" rx="16.8" fill="none" stroke="#60cdff" strokeOpacity=".14" strokeWidth=".8" />
+      <g transform="translate(-2.909091 -2.909091) scale(1.4545455)">
+        <path d="M14 13v22M14 24h10M24 13v22" stroke="#60cdff" strokeWidth="4.4" strokeLinecap="round" fill="none" />
+        <path d="M31 17.5c3.2 0 5.5 2.6 5.5 6.5S34.2 30.5 31 30.5" stroke="#60cdff" strokeWidth="4" strokeLinecap="round" fill="none" />
+      </g>
+      <path d="M40 27.2 46.3 31.9 40 36.6Z" fill="#b1f5dc" />
+      <path d="M46.7 11.3 52.5 17.1M52.5 11.3 46.7 17.1" stroke="#b1f5dc" strokeWidth="2.9" strokeLinecap="round" />
     </svg>
   );
 }
@@ -110,4 +121,12 @@ export const IFileText = S(<><path d="M6.5 3.5h7.2l3.8 3.8v13.2H6.5z" /><path d=
 export const IInfo = S(<><circle cx="12" cy="12" r="8.5" /><path d="M12 11v5.2" /><circle cx="12" cy="8.1" r="0.9" fill="currentColor" stroke="none" /></>);
 
 export const IBroom = S(<><path d="M14.5 4.5 9 10" /><path d="m9.6 8.6 5.8 5.8" /><path d="M8.4 13.6c-2 1.1-3.2 2.9-3.6 5.4 2.5-.4 4.3-1.6 5.4-3.6" /><path d="m11.6 11.4-1.2 1.2" /></>);
+export const IGlobe = S(
+  <>
+    <circle cx="12" cy="12" r="8.8" />
+    <path d="M3.4 12h17.2" />
+    <path d="M12 3.2c2.6 2.4 4 5.5 4 8.8s-1.4 6.4-4 8.8c-2.6-2.4-4-5.5-4-8.8s1.4-6.4 4-8.8Z" />
+  </>,
+);
+
 export const ISubtitles = S(<><rect x="2.5" y="5" width="19" height="14" rx="2.5" /><path d="M6 10h3M12 10h6M6 14h6M15 14h3" /></>);

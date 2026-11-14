@@ -1,15 +1,15 @@
-import { fmt } from "../api";
+import React from "react";
+import { cover, fmt } from "../api";
 import type { VideoCard } from "../types";
 import { IHeartF, IPlayF } from "../icons";
 import { Img } from "./ui";
-import { CardGrid } from "./CardGrid";
 
 /* ——— 瀑布流卡片 ——— */
 export function WaterfallCard({ v, onOpen }: { v: VideoCard; onOpen: () => void }) {
   const ratio = 1.32;
   return (
     <button onClick={onOpen}
-      className="relative min-w-0 w-full overflow-hidden text-left bg-s1 elev-1 pressable block rounded-(--r-sm)"
+      className="relative w-full overflow-hidden text-left bg-s1 elev-1 pressable block rounded-(--r-sm)"
       style={{ paddingTop: `${ratio * 100}%` }}>
       <Img src={v.cover} />
       <div className="absolute inset-x-0 bottom-0 h-3/5 bg-gradient-to-t from-black/85 via-black/30 to-transparent" />
@@ -22,7 +22,7 @@ export function WaterfallCard({ v, onOpen }: { v: VideoCard; onOpen: () => void 
       <div className="absolute inset-x-0 bottom-0 p-2">
         <div className="text-[11.5px] font-medium text-white leading-snug clamp-2 tsh">{v.title}</div>
         <div className="flex items-center justify-between mt-1">
-          <span className="text-[9.5px] text-white/65 truncate max-w-[60%]">{v.author?.name || "黄果短剧"}</span>
+          <span className="text-[9.5px] text-white/65 truncate max-w-[60%]">{v.author?.name || "HGhubX"}</span>
           <span className="flex items-center gap-0.5 text-[9.5px] text-white/75"><IHeartF size={10} className="text-white/70" />{fmt(v.like_count)}</span>
         </div>
       </div>
@@ -30,16 +30,22 @@ export function WaterfallCard({ v, onOpen }: { v: VideoCard; onOpen: () => void 
   );
 }
 
-/* 等比例卡片用网格，避免多栏分片导致 WebKit 中绝对定位封面被裁剪。 */
-export function Masonry({ videos, onOpen, gap = "gap-1" }: {
+/* ——— 近无缝瀑布流 ——— */
+/* 卡片固定 1.32 比例，改用 CSS Grid 代替 CSS multi-column：
+   WebKitGTK 2.52.6 在 columns + column-fill:balance 下会裁剪/丢弃第 2、3 列顶部的首卡，
+   Grid 布局绕开该渲染 bug；translateZ(0) 兜底强制合成层，避免再次被裁剪。 */
+export function Masonry({ videos, onOpen, wide = false, gap = "gap-1" }: {
   videos: VideoCard[]; onOpen: (v: VideoCard) => void; wide?: boolean; gap?: string;
 }) {
+  const cols = wide ? "grid-cols-3 xl:grid-cols-4" : "grid-cols-2";
   return (
-    <CardGrid gap={gap === "gap-1" ? 4 : 6}>
+    <div className={`grid ${cols} ${gap} items-start`}>
       {videos.map((v) => (
-        <WaterfallCard key={v.id} v={v} onOpen={() => onOpen(v)} />
+        <div key={v.id} style={{ transform: "translateZ(0)" }}>
+          <WaterfallCard v={v} onOpen={() => onOpen(v)} />
+        </div>
       ))}
-    </CardGrid>
+    </div>
   );
 }
 
@@ -53,6 +59,9 @@ export function RowCard({ v, onOpen }: { v: VideoCard; onOpen: () => void }) {
         <span className="absolute top-1.5 left-1.5 px-1.5 py-0.5 rounded-md text-[8.5px] font-bold brand-grad">
           {v.is_finished ? "完结" : `${v.episode_count}集`}
         </span>
+        {!!v.score && (
+          <span className="absolute bottom-1.5 left-1.5 text-[9px] font-bold text-amber tsh">{v.score.toFixed(1)} 分</span>
+        )}
         <span className="absolute bottom-1.5 right-1.5 flex items-center gap-0.5 text-[9px] font-semibold text-white/90 tsh"><IPlayF size={9} />{fmt(v.hot)}</span>
       </div>
       <div className="mt-1.5 text-[11.5px] font-medium text-on clamp-1 leading-tight">{v.title}</div>

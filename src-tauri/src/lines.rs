@@ -1,21 +1,13 @@
-//! 线路（数据源）：固定线路 + 地址发布页上的镜像线路。
-//!
-//! 上游只是域名在变，请求链路与数据模型完全一致，所以「切线路」等价于换 `net::base()`。
-//! 镜像地址来自 <https://huangguoai.pages.dev/>：那个页面本身是空壳，真正的清单在
-//! `publish.js` 里（`var urls` 域名数组 + `var subdomains` 子域数组，页面自己随机拼）。
+//! 线路（数据源）：固定线路。唯一播放源固定为 huangguoai.com，不再解析镜像。
 
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 
 /// 固定线路：写死在客户端里，不依赖任何外部页面。
-pub const FIXED: [(&str, &str); 2] = [
+pub const FIXED: [(&str, &str); 1] = [
     ("固定线路 1", "https://huangguoai.com"),
-    ("固定线路 2", "https://huangguoai.ai"),
 ];
 
-const PUBLISH_PAGE: &str = "https://huangguoai.pages.dev/";
-/// 镜像列表上限（子域 × 域名是笛卡尔积，界面只展示这么多）
-const MIRROR_MAX: usize = 60;
 /// 单条线路探测超时
 const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 
@@ -26,46 +18,14 @@ pub fn fixed() -> Value {
         .collect::<Vec<_>>())
 }
 
-/// 拉地址发布页 → 解析 publish.js → 拼出镜像地址。只在用户点开「线路」时调用。
+/// 镜像列表：唯一播放源已固定为 huangguoai.com，不再抓发布页、不探镜像。
+/// 保留命令签名与返回结构，前端看到的始终是空列表。
 pub async fn mirrors() -> Result<Value, String> {
-    let html = get_text(PUBLISH_PAGE).await?;
-    let js_rel = script_src(&html).unwrap_or_else(|| "publish.js".to_string());
-    let js_url = absolute(PUBLISH_PAGE, &js_rel);
-    let js = get_text(&js_url).await?;
-
-    let domains = js_array(&js, "var urls");
-    let subs = js_array(&js, "var subdomains");
-    if domains.is_empty() {
-        return Err("地址发布页格式有变化：没找到镜像域名".to_string());
-    }
-
-    let mut items: Vec<Value> = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    'outer: for domain in domains {
-        let domain = domain.trim_end_matches('/').to_string();
-        if domain.is_empty() {
-            continue;
-        }
-        let hosts: Vec<String> = if subs.is_empty() {
-            vec![domain.clone()]
-        } else {
-            subs.iter().map(|s| format!("{s}.{domain}")).collect()
-        };
-        for host in hosts {
-            if !seen.insert(host.clone()) {
-                continue;
-            }
-            items.push(json!({ "url": format!("https://{host}"), "host": host }));
-            if items.len() >= MIRROR_MAX {
-                break 'outer;
-            }
-        }
-    }
-    if items.is_empty() {
-        return Err("地址发布页里没有可用的镜像地址".to_string());
-    }
-
-    Ok(json!({ "source": PUBLISH_PAGE, "script": js_url, "items": items }))
+    Ok(json!({
+        "source": "",
+        "items": [],
+        "recommended": [],
+    }))
 }
 
 /// 可达性探测（并发 6 条一组）。只报结果，不做自动切换。
@@ -106,153 +66,117 @@ async fn probe_one(url: String) -> Value {
     }
 }
 
-async fn get_text(url: &str) -> Result<String, String> {
-    let resp = crate::net::get(url, Duration::from_secs(12), None, None).await?;
-    if !resp.status().is_success() {
-        return Err(format!("HTTP {}", resp.status()));
-    }
-    resp.text().await.map_err(|e| crate::net::err_text(&e))
+/* ───────────────────────── 自动选线 ───────────────────────── */
+
+/// 自动选线的主站候选（唯一线路）。
+pub const AUTO_LINES: [(&str, &str); 1] = [("main", crate::net::DEFAULT_BASE)];
+/// 判活就打这一个请求，成本等于 ping：能返回 200 就是这条线路能用。
+const AUTO_PROBE_PATH: &str = "/api/videos?page=1&size=1";
+/// 探测超时：只在启动/换网时用，等太久不如直接用另一条。
+const AUTO_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 一条候选线路的探测结果。
+#[derive(Clone)]
+pub struct Hit {
+    pub tier: &'static str,
+    pub url: String,
+    pub ok: bool,
+    pub reachable: bool,
+    pub ms: u64,
+    pub status: Option<u16>,
 }
 
-/// 从 HTML 里挑出脚本地址（发布页只有一个 `publish.js?<版本>`）。
-fn script_src(html: &str) -> Option<String> {
-    let mut rest = html;
-    while let Some(i) = rest.find("src=\"") {
-        let after = &rest[i + 5..];
-        let end = after.find('"')?;
-        let candidate = &after[..end];
-        if candidate.contains(".js") {
-            return Some(candidate.to_string());
-        }
-        rest = &after[end..];
-    }
-    None
-}
-
-fn absolute(base: &str, rel: &str) -> String {
-    if rel.starts_with("http://") || rel.starts_with("https://") {
-        return rel.to_string();
-    }
-    let origin = url::Url::parse(base)
-        .ok()
-        .map(|u| format!("{}://{}", u.scheme(), u.host_str().unwrap_or_default()));
-    match origin {
-        Some(o) if rel.starts_with('/') => format!("{o}{rel}"),
-        Some(o) => format!("{o}/{rel}"),
-        None => rel.to_string(),
-    }
-}
-
-/// 取 JS 里 `var <name> = [ ... ]` 的字符串数组（去掉行尾 `//` 注释，但保留字符串里的 `//`）。
-fn js_array(src: &str, decl: &str) -> Vec<String> {
-    let Some(at) = src.find(decl) else {
-        return Vec::new();
-    };
-    let rest = &src[at..];
-    let Some(open) = rest.find('[') else {
-        return Vec::new();
-    };
-    let Some(close) = rest[open..].find(']') else {
-        return Vec::new();
-    };
-    strip_line_comments(&rest[open + 1..open + close])
-        .split(',')
-        .map(|raw| {
-            raw.trim()
-                .trim_matches(|c: char| c == '\'' || c == '"')
-                .trim()
-                .to_string()
+impl Hit {
+    fn json(&self) -> Value {
+        json!({
+            "tier": self.tier,
+            "url": self.url,
+            "ok": self.ok,
+            "reachable": self.reachable,
+            "ms": self.ms,
+            "status": self.status,
         })
-        .filter(|s| !s.is_empty())
-        .collect()
+    }
 }
 
-/// 去掉 `//` 行尾注释（引号内的 `//` 是 URL，不能动）。
-fn strip_line_comments(body: &str) -> String {
-    let mut out = String::with_capacity(body.len());
-    let mut quote: Option<char> = None;
-    let mut chars = body.chars().peekable();
-    while let Some(c) = chars.next() {
-        match quote {
-            Some(q) => {
-                out.push(c);
-                if c == q {
-                    quote = None;
-                }
-            }
-            None => {
-                if c == '\'' || c == '"' {
-                    quote = Some(c);
-                    out.push(c);
-                } else if c == '/' && chars.peek() == Some(&'/') {
-                    for n in chars.by_ref() {
-                        if n == '\n' {
-                            out.push('\n');
-                            break;
-                        }
-                    }
-                } else {
-                    out.push(c);
-                }
+async fn probe_hit(tier: &'static str, url: &str) -> Hit {
+    let target = format!("{}{}", url.trim_end_matches('/'), AUTO_PROBE_PATH);
+    let started = Instant::now();
+    let res = crate::net::get(&target, AUTO_PROBE_TIMEOUT, Some("application/json"), None).await;
+    let ms = started.elapsed().as_millis() as u64;
+    match res {
+        Ok(r) => {
+            let status = r.status().as_u16();
+            Hit {
+                tier,
+                url: url.to_string(),
+                // 只看接口：首页 200 不代表能用（.ai 就是 200 + /api 全 404）
+                ok: status == 200,
+                reachable: status < 500,
+                ms,
+                status: Some(status),
             }
         }
+        Err(_) => Hit {
+            tier,
+            url: url.to_string(),
+            ok: false,
+            reachable: false,
+            ms,
+            status: None,
+        },
     }
-    out
+}
+
+/// 自动选线：唯一播放源固定为 huangguoai.com，不再探测、不再切镜像。
+///
+/// 保留返回结构与 `reason` 字段；`base` 恒为主站，前端据此只会停在 main。
+pub async fn auto_pick() -> Value {
+    let (main_tier, main_url) = AUTO_LINES[0];
+    json!({
+        "base": main_url,
+        "tier": main_tier,
+        "ms": 0,
+        "reason": "main-fixed",
+        "candidates": [{
+            "tier": main_tier,
+            "url": main_url,
+            "ok": true,
+            "reachable": true,
+            "ms": 0,
+            "status": null,
+        }],
+    })
+}
+/// 回切主站：主站就是唯一线路，恒返回主站可用，不发请求。
+pub async fn try_main() -> Value {
+    let (tier, url) = AUTO_LINES[0];
+    json!({
+        "ok": true,
+        "base": url,
+        "tier": tier,
+        "ms": 0,
+        "status": null,
+    })
+}
+/// 判活「当前线路」：和 [`auto_pick`] 用同一个请求（`/api/videos?page=1&size=1`）。
+///
+/// 只看首页不行——`.ai` 首页 200、`/api` 全 404，首页判活会把体检结论骗成「通」，
+/// 于是坏线路一直不被换掉。这里探的是真接口，通就是真能出内容。
+pub async fn health() -> Value {
+    let current = crate::net::base();
+    let hit = probe_hit("current", &current).await;
+    json!({
+        "base": current,
+        "ok": hit.ok,
+        "ms": hit.ms,
+        "status": hit.status,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const SAMPLE: &str = r#"
-var subdomains = [
-    'thu',  // 清华
-    'pku',  // 北大
-];
-var urls=[
-	'xxbgwypx.cc/',
-];
-var otherUrls = [
-	'https://huangguoai.pages.dev',
-];
-var foreverUrls = [
-	  'https://huangguoai.com',
-	JumpPage,
-	'https://huangguoai.ai',
-];
-"#;
-
-    #[test]
-    fn parses_publish_js_arrays() {
-        assert_eq!(js_array(SAMPLE, "var urls"), vec!["xxbgwypx.cc/"]);
-        assert_eq!(js_array(SAMPLE, "var subdomains"), vec!["thu", "pku"]);
-        assert_eq!(
-            js_array(SAMPLE, "var foreverUrls"),
-            vec![
-                "https://huangguoai.com",
-                "JumpPage",
-                "https://huangguoai.ai"
-            ]
-        );
-    }
-
-    #[test]
-    fn resolves_relative_script() {
-        assert_eq!(
-            absolute("https://huangguoai.pages.dev/", "publish.js?20261103-2"),
-            "https://huangguoai.pages.dev/publish.js?20261103-2"
-        );
-        assert_eq!(
-            absolute("https://huangguoai.pages.dev/", "/a/b.js"),
-            "https://huangguoai.pages.dev/a/b.js"
-        );
-    }
-
-    #[test]
-    fn picks_script_src() {
-        let html = r#"<link rel="stylesheet" href="publish.css?1" /><script type="text/javascript" src="publish.js?20261103-2"></script>"#;
-        assert_eq!(script_src(html).as_deref(), Some("publish.js?20261103-2"));
-    }
 
     /// 手动跑：`cargo test --lib -- --ignored lines::tests::mirrors_live -- --nocapture`
     #[tokio::test]
